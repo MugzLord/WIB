@@ -251,7 +251,7 @@ def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int
     else:
         sorted_pairs = sorted(list(enumerate(values)), key=lambda x: x[1])
     correct_indices = [idx for idx, _ in sorted_pairs]
-    prompt = f"Box {box_id}: {mode}\n" + "\n".join(items) + "\n\nSubmit with: /order A B C D E"
+    prompt = f"Box {box_id}: {mode}\n" + "\n".join(items) + "\n\nSubmit with: /wib order A B C D E"
     return prompt, items, correct_indices
 
 def gen_phrase_and_deck(seed: int, box_id: int) -> Tuple[Tuple[str, str, str], List[dict]]:
@@ -991,7 +991,7 @@ async def reveal(interaction: discord.Interaction):
     await interaction.response.send_message(embed=emb)
 
 
-@wib.command(name="q_order", description="Generate an arrange (5 items) question preview for current slot holder (host preview with Publish/Regenerate).")
+@wib.command(name="q_order", description="Preview an arrange question for the slot holder.")
 async def q_order(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not has_host_role(interaction.user):
         return await interaction.response.send_message("Host permission required.", ephemeral=True)
@@ -1039,7 +1039,8 @@ async def q_order(interaction: discord.Interaction):
 
             msg = await pix.channel.send(embed=discord.Embed(
                 title=f"Box {box_id} — Arrange Question",
-                description=f"{prompt}\n\nOnly the slot holder may answer using **/order A B C D E**."
+                description=f"{prompt}\n\n "Only the slot holder may answer using **/wib order A B C D E**."
+
             ))
             con3 = db()
             try:
@@ -1070,7 +1071,7 @@ async def q_order(interaction: discord.Interaction):
     await do_preview(interaction, salt=random.randint(0, 9999))
 
 
-@wib.command(name="order", description="Slot holder: submit the order (A B C D E). Each correct position = 1 turn.")
+@wib.command(name="order", description="Slot holder submits the order (A B C D E).")
 @app_commands.describe(a="First", b="Second", c="Third", d="Fourth", e="Fifth")
 async def order(interaction: discord.Interaction, a: str, b: str, c: str, d: str, e: str):
     letters = [a, b, c, d, e]
