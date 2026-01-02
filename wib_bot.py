@@ -1,19 +1,3 @@
-# wib_bot.py
-# Discord bot: "What's in the Box" (Design v1.0)
-#
-# Notes:
-# - No user-facing text mentions any automated generation tooling.
-# - Host-paced controls: publish/regenerate questions, reveal winners, check puzzle, show STEAL/DONATE/PASS UI, eliminations, box opening.
-#
-# Requirements:
-#   pip install -U discord.py python-dotenv
-#
-# Environment:
-#   DISCORD_TOKEN=...
-#   OWNER_ID=123456789012345678   # Mike only
-#   HOST_ROLE_NAME=Game Host      # role allowed to host controls (optional; leave blank to allow admins)
-#   DB_PATH=./wib.db
-
 import os
 import re
 import time
