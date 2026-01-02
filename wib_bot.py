@@ -904,24 +904,6 @@ async def wib_q(interaction: discord.Interaction):
 
     await do_preview(interaction, salt=random.randint(0, 9999))
 
-
-        async def on_regen(rix: discord.Interaction):
-            if rix.user.id != interaction.user.id:
-                return await rix.response.send_message("Only the host who generated this preview can regenerate it.", ephemeral=True)
-            await rix.response.defer(ephemeral=True)
-            await do_preview(rix, salt=random.randint(1, 99999))
-
-        async def on_cancel(cix: discord.Interaction):
-            if cix.user.id != interaction.user.id:
-                return await cix.response.send_message("Only the host who generated this preview can cancel it.", ephemeral=True)
-            await cix.response.send_message("Cancelled.", ephemeral=True)
-
-        view = PreviewPublishView(on_publish, on_regen, on_cancel)
-        await ix.response.send_message(embed=emb, view=view, ephemeral=True)
-
-    await do_preview(interaction, salt=random.randint(0, 9999))
-
-
 # Keep /wib num as fallback (button flow is primary)
 @wib.command(name="num", description="(Fallback) Submit your numeric answer for the active question.")
 @app_commands.describe(value="Your numeric answer")
