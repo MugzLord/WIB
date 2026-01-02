@@ -824,7 +824,7 @@ async def lock(interaction: discord.Interaction):
     await interaction.response.send_message(f"Entries locked. Registered players: **{pcount}**.\nSession seed locked.")
 
 
-@bot.tree.command(name="wib_q", description="Generate a numeric question preview for current box (Publish/Regenerate).")
+@bot.tree.command(name="wib_q", description="Preview a numeric question for the current box.")
 @app_commands.guild_only()
 async def wib_q(interaction: discord.Interaction):
     # --- this is the SAME body as your existing /wib q_numeric ---
