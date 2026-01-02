@@ -391,6 +391,58 @@ class PreviewPublishView(discord.ui.View):
         await self.on_cancel(interaction)
         self.stop()
 
+class NumericAnswerModal(discord.ui.Modal, title="Submit Answer"):
+    answer = discord.ui.TextInput(label="Your number", placeholder="Enter a whole number", max_length=12)
+
+    def __init__(self, guild_id: int, channel_id: int, box_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.box_id = box_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        val = norm_num(str(self.answer))
+        if val is None:
+            return await interaction.response.send_message("Invalid number. Use whole numbers only.", ephemeral=True)
+
+        con = db()
+        try:
+            sess = con.execute(
+                "SELECT * FROM sessions WHERE guild_id=? AND channel_id=?",
+                (self.guild_id, self.channel_id),
+            ).fetchone()
+            if not sess or int(sess["is_locked"]) != 1:
+                return await interaction.response.send_message("No active locked session.", ephemeral=True)
+
+            # Must be registered & not eliminated
+            if not is_registered(con, self.guild_id, self.channel_id, interaction.user.id):
+                return await interaction.response.send_message("You are not registered (or you are eliminated).", ephemeral=True)
+
+            tr = con.execute(
+                "SELECT is_active FROM trivia_rounds WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (self.guild_id, self.channel_id, self.box_id),
+            ).fetchone()
+            if not tr or int(tr["is_active"]) != 1:
+                return await interaction.response.send_message("No active numeric question right now.", ephemeral=True)
+
+            # First submission only
+            existing = con.execute(
+                "SELECT 1 FROM trivia_submissions WHERE guild_id=? AND channel_id=? AND box_id=? AND user_id=?",
+                (self.guild_id, self.channel_id, self.box_id, interaction.user.id),
+            ).fetchone()
+            if existing:
+                return await interaction.response.send_message("Your submission is already recorded.", ephemeral=True)
+
+            con.execute(
+                """INSERT INTO trivia_submissions (guild_id, channel_id, box_id, user_id, value_int, submitted_at_ms)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (self.guild_id, self.channel_id, self.box_id, interaction.user.id, int(val), now_ms()),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        await interaction.response.send_message("Submitted.", ephemeral=True)
 
 class PuzzleModal(discord.ui.Modal, title="Submit Puzzle"):
     w1 = discord.ui.TextInput(label="Word 1", placeholder="FIRST WORD", max_length=32)
@@ -433,6 +485,17 @@ class PuzzleModal(discord.ui.Modal, title="Submit Puzzle"):
 
         await interaction.response.send_message("Submitted.", ephemeral=True)
 
+class NumericAnswerView(discord.ui.View):
+    def __init__(self, guild_id: int, channel_id: int, box_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.box_id = box_id
+
+    @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:numeric_answer")
+    async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Open modal; modal itself handles all checks + first-submission rule
+        await interaction.response.send_modal(NumericAnswerModal(self.guild_id, self.channel_id, self.box_id))
 
 class CardPickView(discord.ui.View):
     def __init__(self, bot: commands.Bot, guild_id: int, channel_id: int, box_id: int):
@@ -860,10 +923,14 @@ async def q_numeric(interaction: discord.Interaction):
 
             # publish to channel
             channel = pix.channel
-            msg = await channel.send(embed=discord.Embed(
-                title=f"Box {box_id} — Numeric Question",
-                description=f"{q}\n\nSubmit your answer with: **/num <number>**\n(Registered players only. First submission counts.)"
-            ))
+            msg = await channel.send(
+                embed=discord.Embed(
+                    title=f"Box {box_id} — Numeric Question",
+                    description=f"{q}\n\nClick **Answer** to submit.\n(Registered players only. First submission counts.)"
+                ),
+                view=NumericAnswerView(pix.guild_id, pix.channel_id, box_id)
+            )
+
             con3 = db()
             try:
                 con3.execute(
