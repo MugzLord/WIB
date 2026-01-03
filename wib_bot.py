@@ -530,9 +530,9 @@ class OrderAnswerView(discord.ui.View):
         self.channel_id = channel_id
         self.box_id = box_id
 
-    #@discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:order_answer")
-    #async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:order_answer")
+    async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Only the current slot holder can answer
         con = db()
         try:
             row = con.execute(
@@ -542,7 +542,9 @@ class OrderAnswerView(discord.ui.View):
         finally:
             con.close()
 
-        if not row or row["slot_user_id"] is None or int(row["slot_user_id"]) != interaction.user.id:    
+        if not row or row["slot_user_id"] is None or int(row["slot_user_id"]) != interaction.user.id:
+            return await interaction.response.send_message("Only the current slot holder may answer.", ephemeral=True)
+
         await interaction.response.send_modal(OrderAnswerModal(self.guild_id, self.channel_id, self.box_id))
 
 class PuzzleModal(discord.ui.Modal, title="Submit Puzzle"):
