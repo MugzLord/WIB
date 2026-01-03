@@ -872,6 +872,7 @@ async def lock(interaction: discord.Interaction):
         ensure_box_secret(con, interaction.guild_id, interaction.channel_id, seed, 1)
     finally:
         con.close()
+        
     if lobby_msg_id:
         channel = interaction.channel
         if isinstance(channel, discord.TextChannel):
@@ -1027,8 +1028,9 @@ async def reveal(interaction: discord.Interaction):
             return await interaction.response.send_message("No active question.", ephemeral=True)
 
         correct = int(tr["answer_int"])
-        winner_id = compute_trivia_winner(con, interaction.guild_id, interaction.channel_id, box_id, correct)
-
+        outcome = compute_trivia_outcome(con, interaction.guild_id, interaction.channel_id, box_id, correct)
+        winner_id = outcome[0] if outcome else None
+        
         con.execute(
             "UPDATE trivia_rounds SET is_active=0 WHERE guild_id=? AND channel_id=? AND box_id=?",
             (interaction.guild_id, interaction.channel_id, box_id),
@@ -1047,12 +1049,33 @@ async def reveal(interaction: discord.Interaction):
         return await interaction.response.send_message("No submissions. No slot assigned.", ephemeral=False)
 
     winner = interaction.guild.get_member(winner_id)
-    emb = discord.Embed(
-        title=f"Box {box_id} — Slot Assigned",
-        description=f"Slot holder: {winner.mention if winner else f'<@{winner_id}>'}\n\nHost: generate the arrange question with **/wib q_order**."
-    )
-    await interaction.response.send_message(embed=emb)
+    winner_mention = winner.mention if winner else f"<@{winner_id}>"
+    correct_line = f"The correct answer is **{correct}**."
+    await interaction.response.send_message(embed=discord.Embed(
+        title=f"Box {box_id} — Answer Reveal",
+        description=correct_line
+    ))
 
+    await asyncio.sleep(1.2)
+
+    winner_value = outcome[1] if outcome else None
+    was_exact = outcome[2] if outcome else False
+    if was_exact:
+        result_line = f"{winner_mention} got it exactly right with **{winner_value}**!"
+    else:
+        result_line = f"No exact answers. {winner_mention} was closest with **{winner_value}**."
+
+    await interaction.followup.send(embed=discord.Embed(
+        title=f"Box {box_id} — Winner",
+        description=result_line
+    ))
+
+    await asyncio.sleep(0.8)
+    await interaction.followup.send(embed=discord.Embed(
+        title=f"Box {box_id} — Slot Assigned",
+        description=f"Slot holder: {winner_mention}\n\nHost: generate the arrange question with **/wib q_order**."
+    ))
+       
 
 @wib.command(name="q_order", description="Preview an arrange question for the slot holder.")
 async def q_order(interaction: discord.Interaction):
