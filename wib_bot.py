@@ -5,6 +5,8 @@ import time
 import json
 import sqlite3
 import random
+import urllib.error
+import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 import discord
@@ -18,6 +20,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "./wib.db")
 HOST_ROLE_NAME = (os.getenv("HOST_ROLE_NAME", "") or "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN in environment.")
@@ -209,13 +212,6 @@ init_db()
 # Session-unique content generation (seeded)
 # -----------------------------
 
-NUMERIC_TEMPLATES = [
-    "Box {box}: Closest to the secret code between **{low}** and **{high}** wins. Submit an integer.",
-    "Box {box}: Hidden number challenge. Guess the number between **{low}** and **{high}**.",
-    "Box {box}: The vault code is a number from **{low}** to **{high}**. Closest answer wins.",
-    "Box {box}: Pick a number between **{low}** and **{high}**. Closest wins.",
-]
-
 ORDER_TEMPLATES = [
     "Arrange these five deliveries from earliest to latest (1 to 5):",
     "Arrange these five values from smallest to largest (1 to 5):",
@@ -226,16 +222,57 @@ WORD_BANK_1 = ["ONE", "SILVER", "MIDNIGHT", "BRIGHT", "HIDDEN", "GOLDEN", "QUIET
 WORD_BANK_2 = ["FINE", "STILL", "COLD", "TRUE", "SMALL", "WILD", "GREEN", "DARK", "CLEAR", "LAST", "SWEET", "SHARP"]
 WORD_BANK_3 = ["AFTERNOON", "MORNING", "HORIZON", "PROMISE", "WHISPER", "GARDEN", "LANTERN", "SUNRISE", "MOONLIGHT", "COMPASS", "VICTORY", "FIRELIGHT"]
 
+def _parse_openai_question(payload: dict) -> Tuple[str, int]:
+    outputs = payload.get("output", [])
+    text = ""
+    for output in outputs:
+        for content in output.get("content", []):
+            if content.get("type") == "output_text":
+                text += content.get("text", "")
+    data = json.loads(text or "{}")
+    question = str(data.get("question", "")).strip()
+    answer = data.get("answer", None)
+    if not question or not isinstance(answer, int):
+        raise ValueError("OpenAI response missing numeric question/answer.")
+    return question, answer
+
+def _fetch_openai_numeric_question(seed: int) -> Tuple[str, int]:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY in environment.")
+
+    prompt = (
+        "Return JSON only: {\"question\":\"...\",\"answer\":number}.\n"
+        "Make a very simple, kid-friendly trivia question whose answer is a whole number.\n"
+        "Keep it short and avoid math riddles. The answer must be an integer.\n"
+        f"Seed: {seed}"
+    )
+    body = json.dumps({
+        "model": "gpt-4o-mini",
+        "input": prompt,
+        "temperature": 0.4,
+        "max_output_tokens": 120,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = json.load(resp)
+    return _parse_openai_question(payload)
+
 def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
-    rng = random.Random(seed * 100 + box_id * 7 + player_count)
-    tpl = rng.choice(NUMERIC_TEMPLATES)
-    span = rng.randint(50, 200)
-    base = rng.randint(20, 200)
-    low = base
-    high = base + span
-    ans = rng.randint(low, high)
-    q = tpl.format(box=box_id, low=low, high=high)
-    return q, int(ans)
+    q, ans = _fetch_openai_numeric_question(seed + box_id * 7 + player_count)
+    return f"Box {box_id}: {q}", int(ans)
+
+async def generate_numeric_question_async(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
+    q, ans = await asyncio.to_thread(_fetch_openai_numeric_question, seed + box_id * 7 + player_count)
+    return f"Box {box_id}: {q}", int(ans)
 
 def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int]]:
     rng = random.Random(seed * 200 + box_id * 19)
@@ -430,6 +467,84 @@ class NumericAnswerView(discord.ui.View):
     @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:numeric_answer")
     async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(NumericAnswerModal(self.guild_id, self.channel_id, self.box_id))
+
+
+class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
+    a = discord.ui.TextInput(label="First", placeholder="A-E", max_length=1)
+    b = discord.ui.TextInput(label="Second", placeholder="A-E", max_length=1)
+    c = discord.ui.TextInput(label="Third", placeholder="A-E", max_length=1)
+    d = discord.ui.TextInput(label="Fourth", placeholder="A-E", max_length=1)
+    e = discord.ui.TextInput(label="Fifth", placeholder="A-E", max_length=1)
+
+    def __init__(self, guild_id: int, channel_id: int, box_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.box_id = box_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        letters = [str(self.a), str(self.b), str(self.c), str(self.d), str(self.e)]
+        letters = [x.strip().upper() for x in letters]
+        if sorted(letters) != ["A", "B", "C", "D", "E"]:
+            return await interaction.response.send_message("Invalid order. Use each of A B C D E exactly once.", ephemeral=True)
+
+        con = db()
+        try:
+            result = record_order_submission(
+                con,
+                interaction.guild_id,
+                interaction.channel_id,
+                interaction.user.id,
+                letters,
+            )
+        finally:
+            con.close()
+
+        if isinstance(result, str):
+            return await interaction.response.send_message(result, ephemeral=True)
+
+        box_id, turns = result
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel):
+            await channel.send(embed=discord.Embed(
+                title=f"Box {box_id} — Turns Awarded",
+                description=f"{interaction.user.mention} earned **{turns}** turn(s).\n\nUse your turns to reveal cards."
+            ))
+            if turns > 0:
+                await channel.send(
+                    embed=discord.Embed(title=f"Box {box_id} — Card Selection", description="Slot holder: pick a card to reveal."),
+                    view=CardPickView(interaction.guild_id, interaction.channel_id, box_id),
+                )
+                await channel.send(
+                    embed=discord.Embed(title=f"Box {box_id} — Puzzle Submission", description="Slot holder: submit when ready (host will check)."),
+                    view=SubmitPuzzleView(interaction.guild_id, interaction.channel_id, box_id),
+                )
+
+        await interaction.response.send_message("Recorded.", ephemeral=True)
+
+
+class OrderAnswerView(discord.ui.View):
+    def __init__(self, guild_id: int, channel_id: int, box_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.box_id = box_id
+
+    @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:order_answer")
+    async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        con = db()
+        try:
+            row = con.execute(
+                "SELECT slot_user_id FROM slot_state WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (self.guild_id, self.channel_id, self.box_id),
+            ).fetchone()
+        finally:
+            con.close()
+
+        if not row or row["slot_user_id"] is None or int(row["slot_user_id"]) != interaction.user.id:
+            return await interaction.response.send_message("Only the current slot holder may answer.", ephemeral=True)
+
+        await interaction.response.send_modal(OrderAnswerModal(self.guild_id, self.channel_id, self.box_id))
 
 
 class PuzzleModal(discord.ui.Modal, title="Submit Puzzle"):
@@ -793,6 +908,45 @@ def next_closest_puzzle_attempt(con: sqlite3.Connection, guild_id: int, channel_
     scored.sort(key=lambda t: (-t[0], t[1]))
     return scored[0][2]
 
+def record_order_submission(
+    con: sqlite3.Connection,
+    guild_id: int,
+    channel_id: int,
+    user_id: int,
+    letters: List[str],
+) -> Tuple[int, int] | str:
+    sess = con.execute(
+        "SELECT * FROM sessions WHERE guild_id=? AND channel_id=?",
+        (guild_id, channel_id),
+    ).fetchone()
+    if not sess or int(sess["is_locked"]) != 1:
+        return "No active locked session."
+    box_id = int(sess["current_box"])
+    orow = con.execute(
+        "SELECT is_active, slot_user_id, correct_order_json FROM order_rounds WHERE guild_id=? AND channel_id=? AND box_id=?",
+        (guild_id, channel_id, box_id),
+    ).fetchone()
+    if not orow or int(orow["is_active"]) != 1:
+        return "No active arrange question."
+    slot_user_id = int(orow["slot_user_id"])
+    if user_id != slot_user_id:
+        return "Only the current slot holder may answer."
+
+    correct = json.loads(orow["correct_order_json"])
+    submitted_indices = [ord(x) - 65 for x in letters]
+    turns = sum(1 for i in range(5) if submitted_indices[i] == correct[i])
+
+    con.execute(
+        "UPDATE order_rounds SET is_active=0 WHERE guild_id=? AND channel_id=? AND box_id=?",
+        (guild_id, channel_id, box_id),
+    )
+    con.execute(
+        "UPDATE slot_state SET turns_left=?, pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
+        (turns, guild_id, channel_id, box_id),
+    )
+    con.commit()
+    return box_id, turns
+
 async def post_boxes_leaderboard(channel: discord.TextChannel, guild_id: int, channel_id: int):
     con = db()
     try:
@@ -901,13 +1055,25 @@ async def wib_q(interaction: discord.Interaction):
         con.close()
 
     async def do_preview(ix: discord.Interaction, salt: int = 0, edit_response: bool = False):
-        q, ans = gen_numeric_question(seed + salt, box_id, pcount)
+        try:
+            q, ans = await generate_numeric_question_async(seed + salt, box_id, pcount)
+        except RuntimeError as exc:
+            if ix.response.is_done():
+                return await ix.followup.send(str(exc), ephemeral=True)
+            return await ix.response.send_message(str(exc), ephemeral=True)
+        except (json.JSONDecodeError, ValueError, urllib.error.URLError):
+            msg = "OpenAI failed to return a valid numeric question. Try again."
+            if ix.response.is_done():
+                return await ix.followup.send(msg, ephemeral=True)
+            return await ix.response.send_message(msg, ephemeral=True)
         emb = discord.Embed(title=f"Question Preview (Box {box_id})", description=q)
         emb.add_field(name="Answer (host only)", value=str(ans), inline=False)
 
         async def on_publish(pix: discord.Interaction):
             if pix.user.id != interaction.user.id:
                 return await pix.response.send_message("Only the host who generated this preview can publish it.", ephemeral=True)
+            if not pix.response.is_done():
+                await pix.response.defer(ephemeral=True)
 
             con2 = db()
             try:
@@ -944,17 +1110,21 @@ async def wib_q(interaction: discord.Interaction):
             finally:
                 con3.close()
 
-            await pix.response.send_message("Published.", ephemeral=True)
+            await pix.followup.send("Published.", ephemeral=True)
 
         async def on_regen(rix: discord.Interaction):
             if rix.user.id != interaction.user.id:
                 return await rix.response.send_message("Only the host who generated this preview can regenerate it.", ephemeral=True)
+            if not rix.response.is_done():
+                await rix.response.defer(ephemeral=True)
             await do_preview(rix, salt=random.randint(1, 99999), edit_response=True)
 
         async def on_cancel(cix: discord.Interaction):
             if cix.user.id != interaction.user.id:
                 return await cix.response.send_message("Only the host who generated this preview can cancel it.", ephemeral=True)
-            await cix.response.send_message("Cancelled.", ephemeral=True)
+            if not cix.response.is_done():
+                await cix.response.defer(ephemeral=True)
+            await cix.followup.send("Cancelled.", ephemeral=True)
 
         view = PreviewPublishView(on_publish, on_regen, on_cancel)
         if edit_response or ix.response.is_done():
@@ -1057,9 +1227,9 @@ async def reveal(interaction: discord.Interaction):
     winner_value = outcome[1] if outcome else None
     was_exact = outcome[2] if outcome else False
     if was_exact:
-        result_line = f"{winner_mention} got it exactly right with **{winner_value}**!"
+        result_line = f"{winner_mention} got it exactly right with **{winner_value}** and was the fastest."
     else:
-        result_line = f"No exact answers. {winner_mention} was closest with **{winner_value}**."
+        result_line = f"No exact answers. {winner_mention} was closest with **{winner_value}** and fastest."
 
     await interaction.followup.send(embed=discord.Embed(
         title=f"Box {box_id} — Winner",
@@ -1119,11 +1289,13 @@ async def q_order(interaction: discord.Interaction):
             finally:
                 con2.close()
 
-            msg = await pix.channel.send(embed=discord.Embed(
-                title=f"Box {box_id} — Arrange Question",
-                description=f"{prompt}\n\nOnly the slot holder may answer using **/wib order A B C D E**."
-
-            ))
+            msg = await pix.channel.send(
+                embed=discord.Embed(
+                    title=f"Box {box_id} — Arrange Question",
+                    description=f"{prompt}\n\nOnly the slot holder may answer using the **Answer** button."
+                ),
+                view=OrderAnswerView(pix.guild_id, pix.channel_id, box_id),
+            )
             con3 = db()
             try:
                 con3.execute(
@@ -1156,6 +1328,7 @@ async def q_order(interaction: discord.Interaction):
 
 
 @wib.command(name="order", description="Slot holder submits the order (A B C D E).")
+@app_commands.default_permissions()
 @app_commands.describe(a="First", b="Second", c="Third", d="Fourth", e="Fifth")
 async def order(interaction: discord.Interaction, a: str, b: str, c: str, d: str, e: str):
     letters = [a, b, c, d, e]
@@ -1165,37 +1338,20 @@ async def order(interaction: discord.Interaction, a: str, b: str, c: str, d: str
 
     con = db()
     try:
-        sess = con.execute("SELECT * FROM sessions WHERE guild_id=? AND channel_id=?",
-                           (interaction.guild_id, interaction.channel_id)).fetchone()
-        if not sess or int(sess["is_locked"]) != 1:
-            return await interaction.response.send_message("No active locked session.", ephemeral=True)
-        box_id = int(sess["current_box"])
-        orow = con.execute(
-            "SELECT is_active, slot_user_id, correct_order_json FROM order_rounds WHERE guild_id=? AND channel_id=? AND box_id=?",
-            (interaction.guild_id, interaction.channel_id, box_id),
-        ).fetchone()
-        if not orow or int(orow["is_active"]) != 1:
-            return await interaction.response.send_message("No active arrange question.", ephemeral=True)
-        slot_user_id = int(orow["slot_user_id"])
-        if interaction.user.id != slot_user_id:
-            return await interaction.response.send_message("Only the current slot holder may answer.", ephemeral=True)
-
-        correct = json.loads(orow["correct_order_json"])
-        submitted_indices = [ord(x) - 65 for x in letters]
-        turns = sum(1 for i in range(5) if submitted_indices[i] == correct[i])
-
-        con.execute(
-            "UPDATE order_rounds SET is_active=0 WHERE guild_id=? AND channel_id=? AND box_id=?",
-            (interaction.guild_id, interaction.channel_id, box_id),
+        result = record_order_submission(
+            con,
+            interaction.guild_id,
+            interaction.channel_id,
+            interaction.user.id,
+            letters,
         )
-        con.execute(
-            "UPDATE slot_state SET turns_left=?, pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
-            (turns, interaction.guild_id, interaction.channel_id, box_id),
-        )
-        con.commit()
     finally:
         con.close()
 
+    if isinstance(result, str):
+        return await interaction.response.send_message(result, ephemeral=True)
+
+    box_id, turns = result
     channel = interaction.channel
     if isinstance(channel, discord.TextChannel):
         await channel.send(embed=discord.Embed(
