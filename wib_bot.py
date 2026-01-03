@@ -1039,50 +1039,79 @@ async def lock(interaction: discord.Interaction):
 @app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def wib_q(interaction: discord.Interaction):
-    # --- this is the SAME body as your existing /wib q_numeric ---
+    # Permission check
     if not isinstance(interaction.user, discord.Member) or not has_host_role(interaction.user):
         return await interaction.response.send_message("Host permission required.", ephemeral=True)
+
+    # VERY IMPORTANT: defer immediately
+    await interaction.response.defer(ephemeral=True)
 
     con = db()
     try:
         sess = ensure_session(con, interaction.guild_id, interaction.channel_id)
         if int(sess["is_locked"]) != 1:
-            return await interaction.response.send_message("Lock entries first.", ephemeral=True)
+            return await interaction.edit_original_response(
+                content="Lock entries first.",
+                embed=None,
+                view=None,
+            )
+
         box_id = int(sess["current_box"])
-        pcount = get_participant_count(con, interaction.guild_id, interaction.channel_id)
         seed = int(sess["session_seed"])
+        pcount = get_participant_count(con, interaction.guild_id, interaction.channel_id)
     finally:
         con.close()
 
-    async def do_preview(ix: discord.Interaction, salt: int = 0, edit_response: bool = False):
+    async def do_preview(salt: int = 0):
         try:
             q, ans = await generate_numeric_question_async(seed + salt, box_id, pcount)
-        except RuntimeError as exc:
-            if ix.response.is_done():
-                return await ix.followup.send(str(exc), ephemeral=True)
-            return await ix.response.send_message(str(exc), ephemeral=True)
-        except (json.JSONDecodeError, ValueError, urllib.error.URLError):
-            msg = "OpenAI failed to return a valid numeric question. Try again."
-            if ix.response.is_done():
-                return await ix.followup.send(msg, ephemeral=True)
-            return await ix.response.send_message(msg, ephemeral=True)
-        emb = discord.Embed(title=f"Question Preview (Box {box_id})", description=q)
-        emb.add_field(name="Answer (host only)", value=str(ans), inline=False)
+        except Exception:
+            return await interaction.edit_original_response(
+                content="Failed to generate a valid question. Try again.",
+                embed=None,
+                view=None,
+            )
+
+        emb = discord.Embed(
+            title=f"Question Preview (Box {box_id})",
+            description=q
+        )
+        emb.add_field(
+            name="Answer (host only)",
+            value=str(ans),
+            inline=False
+        )
 
         async def on_publish(pix: discord.Interaction):
             if pix.user.id != interaction.user.id:
-                return await pix.response.send_message("Only the host who generated this preview can publish it.", ephemeral=True)
-            if not pix.response.is_done():
-                await pix.response.defer(ephemeral=True)
+                return await pix.response.send_message(
+                    "Only the host who generated this preview can publish it.",
+                    ephemeral=True,
+                )
+
+            await pix.response.defer(ephemeral=True)
 
             con2 = db()
             try:
                 con2.execute(
-                    """INSERT INTO trivia_rounds (guild_id, channel_id, box_id, q_text, answer_int, is_active, created_at_ms)
+                    """INSERT INTO trivia_rounds
+                       (guild_id, channel_id, box_id, q_text, answer_int, is_active, created_at_ms)
                        VALUES (?, ?, ?, ?, ?, 1, ?)
-                       ON CONFLICT(guild_id, channel_id, box_id) DO UPDATE SET
-                         q_text=excluded.q_text, answer_int=excluded.answer_int, is_active=1, created_at_ms=excluded.created_at_ms""",
-                    (pix.guild_id, pix.channel_id, box_id, q, ans, now_ms()),
+                       ON CONFLICT(guild_id, channel_id, box_id)
+                       DO UPDATE SET
+                         q_text=excluded.q_text,
+                         answer_int=excluded.answer_int,
+                         is_active=1,
+                         created_at_ms=excluded.created_at_ms
+                    """,
+                    (
+                        pix.guild_id,
+                        pix.channel_id,
+                        box_id,
+                        q,
+                        ans,
+                        now_ms(),
+                    ),
                 )
                 con2.execute(
                     "DELETE FROM trivia_submissions WHERE guild_id=? AND channel_id=? AND box_id=?",
@@ -1095,9 +1124,13 @@ async def wib_q(interaction: discord.Interaction):
             msg = await pix.channel.send(
                 embed=discord.Embed(
                     title=f"Box {box_id} — Question",
-                    description=f"{q}\n\nClick **Answer** to submit.\n(Registered players only. First submission counts.)"
+                    description=(
+                        f"{q}\n\n"
+                        "Click **Answer** to submit.\n"
+                        "(Registered players only. First submission counts.)"
+                    ),
                 ),
-                view=NumericAnswerView(pix.guild_id, pix.channel_id, box_id)
+                view=NumericAnswerView(pix.guild_id, pix.channel_id, box_id),
             )
 
             con3 = db()
@@ -1114,25 +1147,31 @@ async def wib_q(interaction: discord.Interaction):
 
         async def on_regen(rix: discord.Interaction):
             if rix.user.id != interaction.user.id:
-                return await rix.response.send_message("Only the host who generated this preview can regenerate it.", ephemeral=True)
-            if not rix.response.is_done():
-                await rix.response.defer(ephemeral=True)
-            await do_preview(rix, salt=random.randint(1, 99999), edit_response=True)
+                return await rix.response.send_message(
+                    "Only the host who generated this preview can regenerate it.",
+                    ephemeral=True,
+                )
+            await rix.response.defer(ephemeral=True)
+            await do_preview(salt=random.randint(1, 99999))
 
         async def on_cancel(cix: discord.Interaction):
             if cix.user.id != interaction.user.id:
-                return await cix.response.send_message("Only the host who generated this preview can cancel it.", ephemeral=True)
-            if not cix.response.is_done():
-                await cix.response.defer(ephemeral=True)
+                return await cix.response.send_message(
+                    "Only the host who generated this preview can cancel it.",
+                    ephemeral=True,
+                )
+            await cix.response.defer(ephemeral=True)
             await cix.followup.send("Cancelled.", ephemeral=True)
 
         view = PreviewPublishView(on_publish, on_regen, on_cancel)
-        if edit_response or ix.response.is_done():
-            await ix.edit_original_response(embed=emb, view=view)
-        else:
-            await ix.response.send_message(embed=emb, view=view, ephemeral=True)
-            
-    await do_preview(interaction, salt=random.randint(0, 9999))
+        await interaction.edit_original_response(
+            content=None,
+            embed=emb,
+            view=view,
+        )
+
+    await do_preview(salt=random.randint(0, 9999))
+
 
 # Keep /wib num as fallback (button flow is primary)
 @wib.command(name="num", description="(Fallback) Submit your answer for the active question.")
