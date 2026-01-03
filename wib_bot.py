@@ -212,7 +212,6 @@ init_db()
 # Session-unique content generation (seeded)
 # -----------------------------
 
-
 ORDER_TEMPLATES = [
     "Arrange these five deliveries from earliest to latest (1 to 5):",
     "Arrange these five values from smallest to largest (1 to 5):",
@@ -266,6 +265,10 @@ def _fetch_openai_numeric_question(seed: int) -> Tuple[str, int]:
     with urllib.request.urlopen(req, timeout=20) as resp:
         payload = json.load(resp)
     return _parse_openai_question(payload)
+
+def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
+    q, ans = _fetch_openai_numeric_question(seed + box_id * 7 + player_count)
+    return f"Box {box_id}: {q}", int(ans)
 
 async def generate_numeric_question_async(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
     q, ans = await asyncio.to_thread(_fetch_openai_numeric_question, seed + box_id * 7 + player_count)
@@ -464,6 +467,7 @@ class NumericAnswerView(discord.ui.View):
     @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:numeric_answer")
     async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(NumericAnswerModal(self.guild_id, self.channel_id, self.box_id))
+
 
 class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
     a = discord.ui.TextInput(label="First", placeholder="A-E", max_length=1)
@@ -891,6 +895,7 @@ def next_closest_puzzle_attempt(con: sqlite3.Connection, guild_id: int, channel_
         scored.append((score, int(a["submitted_at_ms"]), a))
     scored.sort(key=lambda t: (-t[0], t[1]))
     return scored[0][2]
+
 def record_order_submission(
     con: sqlite3.Connection,
     guild_id: int,
@@ -929,6 +934,7 @@ def record_order_submission(
     )
     con.commit()
     return box_id, turns
+
 async def post_boxes_leaderboard(channel: discord.TextChannel, guild_id: int, channel_id: int):
     con = db()
     try:
@@ -1037,7 +1043,17 @@ async def wib_q(interaction: discord.Interaction):
         con.close()
 
     async def do_preview(ix: discord.Interaction, salt: int = 0, edit_response: bool = False):
-        q, ans = gen_numeric_question(seed + salt, box_id, pcount)
+        try:
+            q, ans = await generate_numeric_question_async(seed + salt, box_id, pcount)
+        except RuntimeError as exc:
+            if ix.response.is_done():
+                return await ix.followup.send(str(exc), ephemeral=True)
+            return await ix.response.send_message(str(exc), ephemeral=True)
+        except (json.JSONDecodeError, ValueError, urllib.error.URLError):
+            msg = "OpenAI failed to return a valid numeric question. Try again."
+            if ix.response.is_done():
+                return await ix.followup.send(msg, ephemeral=True)
+            return await ix.response.send_message(msg, ephemeral=True)
         emb = discord.Embed(title=f"Question Preview (Box {box_id})", description=q)
         emb.add_field(name="Answer (host only)", value=str(ans), inline=False)
 
@@ -1046,7 +1062,7 @@ async def wib_q(interaction: discord.Interaction):
                 return await pix.response.send_message("Only the host who generated this preview can publish it.", ephemeral=True)
             if not pix.response.is_done():
                 await pix.response.defer(ephemeral=True)
-                
+
             con2 = db()
             try:
                 con2.execute(
@@ -1088,7 +1104,7 @@ async def wib_q(interaction: discord.Interaction):
             if rix.user.id != interaction.user.id:
                 return await rix.response.send_message("Only the host who generated this preview can regenerate it.", ephemeral=True)
             if not rix.response.is_done():
-                await rix.response.defer(ephemeral=True)          
+                await rix.response.defer(ephemeral=True)
             await do_preview(rix, salt=random.randint(1, 99999), edit_response=True)
 
         async def on_cancel(cix: discord.Interaction):
@@ -1097,7 +1113,7 @@ async def wib_q(interaction: discord.Interaction):
             if not cix.response.is_done():
                 await cix.response.defer(ephemeral=True)
             await cix.followup.send("Cancelled.", ephemeral=True)
-            
+
         view = PreviewPublishView(on_publish, on_regen, on_cancel)
         if edit_response or ix.response.is_done():
             await ix.edit_original_response(embed=emb, view=view)
@@ -1261,11 +1277,13 @@ async def q_order(interaction: discord.Interaction):
             finally:
                 con2.close()
 
-            msg = await pix.channel.send(embed=discord.Embed(
-                title=f"Box {box_id} — Arrange Question",
-                description=f"{prompt}\n\nOnly the slot holder may answer using **/wib order A B C D E**."
-
-            ))
+            msg = await pix.channel.send(
+                embed=discord.Embed(
+                    title=f"Box {box_id} — Arrange Question",
+                    description=f"{prompt}\n\nOnly the slot holder may answer using the **Answer** button."
+                ),
+                view=OrderAnswerView(pix.guild_id, pix.channel_id, box_id),
+            )
             con3 = db()
             try:
                 con3.execute(
@@ -1315,9 +1333,9 @@ async def order(interaction: discord.Interaction, a: str, b: str, c: str, d: str
             interaction.user.id,
             letters,
         )
-        
     finally:
         con.close()
+
     if isinstance(result, str):
         return await interaction.response.send_message(result, ephemeral=True)
 
