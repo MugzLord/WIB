@@ -210,10 +210,10 @@ init_db()
 # -----------------------------
 
 NUMERIC_TEMPLATES = [
-    "Box {box}: Using seed {seed}, compute: (seed % 97) + (players * {k}). Answer as an integer.",
-    "Box {box}: Take seed {seed}. Compute: (seed % 100) - {k} + (players * 2). Answer as an integer.",
-    "Box {box}: Let N be number of registered players ({players}). Compute: (seed % 89) + N + {k}.",
-    "Box {box}: Compute: (seed % 73) + ({k} * players) - (box * 3).",
+    "Box {box}: Closest to the secret code between **{low}** and **{high}** wins. Submit an integer.",
+    "Box {box}: Hidden number challenge. Guess the number between **{low}** and **{high}**.",
+    "Box {box}: The vault code is a number from **{low}** to **{high}**. Closest answer wins.",
+    "Box {box}: Pick a number between **{low}** and **{high}**. Closest wins.",
 ]
 
 ORDER_TEMPLATES = [
@@ -229,16 +229,12 @@ WORD_BANK_3 = ["AFTERNOON", "MORNING", "HORIZON", "PROMISE", "WHISPER", "GARDEN"
 def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
     rng = random.Random(seed * 100 + box_id * 7 + player_count)
     tpl = rng.choice(NUMERIC_TEMPLATES)
-    k = rng.randint(3, 11)
-    if "seed % 97" in tpl:
-        ans = (seed % 97) + (player_count * k)
-    elif "seed % 100" in tpl:
-        ans = (seed % 100) - k + (player_count * 2)
-    elif "seed % 89" in tpl:
-        ans = (seed % 89) + player_count + k
-    else:
-        ans = (seed % 73) + (k * player_count) - (box_id * 3)
-    q = tpl.format(seed=seed, box=box_id, players=player_count, k=k)
+    span = rng.randint(50, 200)
+    base = rng.randint(20, 200)
+    low = base
+    high = base + span
+    ans = rng.randint(low, high)
+    q = tpl.format(box=box_id, low=low, high=high)
     return q, int(ans)
 
 def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int]]:
