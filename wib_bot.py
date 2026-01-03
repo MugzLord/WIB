@@ -427,6 +427,72 @@ class NumericAnswerView(discord.ui.View):
     async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(NumericAnswerModal(self.guild_id, self.channel_id, self.box_id))
 
+class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
+    a = discord.ui.TextInput(label="First", placeholder="A-E", max_length=1)
+    b = discord.ui.TextInput(label="Second", placeholder="A-E", max_length=1)
+    c = discord.ui.TextInput(label="Third", placeholder="A-E", max_length=1)
+    d = discord.ui.TextInput(label="Fourth", placeholder="A-E", max_length=1)
+    e = discord.ui.TextInput(label="Fifth", placeholder="A-E", max_length=1)
+
+    def __init__(self, guild_id: int, channel_id: int, box_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.box_id = box_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        letters = [str(self.a), str(self.b), str(self.c), str(self.d), str(self.e)]
+        letters = [x.strip().upper() for x in letters]
+        if sorted(letters) != ["A", "B", "C", "D", "E"]:
+            return await interaction.response.send_message("Invalid order. Use each of A B C D E exactly once.", ephemeral=True)
+
+        con = db()
+        try:
+            result = record_order_submission(
+                con,
+                interaction.guild_id,
+                interaction.channel_id,
+                interaction.user.id,
+                letters,
+            )
+        finally:
+            con.close()
+
+        if isinstance(result, str):
+            return await interaction.response.send_message(result, ephemeral=True)
+
+        box_id, turns = result
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel):
+            await channel.send(embed=discord.Embed(
+                title=f"Box {box_id} — Turns Awarded",
+                description=f"{interaction.user.mention} earned **{turns}** turn(s).\n\nUse your turns to reveal cards."
+            ))
+            if turns > 0:
+                await channel.send(
+                    embed=discord.Embed(title=f"Box {box_id} — Card Selection", description="Slot holder: pick a card to reveal."),
+                    view=CardPickView(interaction.guild_id, interaction.channel_id, box_id),
+                )
+                await channel.send(
+                    embed=discord.Embed(title=f"Box {box_id} — Puzzle Submission", description="Slot holder: submit when ready (host will check)."),
+                    view=SubmitPuzzleView(interaction.guild_id, interaction.channel_id, box_id),
+                )
+
+        await interaction.response.send_message("Recorded.", ephemeral=True)
+
+
+class OrderAnswerView(discord.ui.View):
+    def __init__(self, guild_id: int, channel_id: int, box_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.box_id = box_id
+
+    @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:order_answer")
+    async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(OrderAnswerModal(self.guild_id, self.channel_id, self.box_id))
+
+
 
 class PuzzleModal(discord.ui.Modal, title="Submit Puzzle"):
     w1 = discord.ui.TextInput(label="Word 1", placeholder="FIRST WORD", max_length=32)
@@ -788,7 +854,44 @@ def next_closest_puzzle_attempt(con: sqlite3.Connection, guild_id: int, channel_
         scored.append((score, int(a["submitted_at_ms"]), a))
     scored.sort(key=lambda t: (-t[0], t[1]))
     return scored[0][2]
+def record_order_submission(
+    con: sqlite3.Connection,
+    guild_id: int,
+    channel_id: int,
+    user_id: int,
+    letters: List[str],
+) -> Tuple[int, int] | str:
+    sess = con.execute(
+        "SELECT * FROM sessions WHERE guild_id=? AND channel_id=?",
+        (guild_id, channel_id),
+    ).fetchone()
+    if not sess or int(sess["is_locked"]) != 1:
+        return "No active locked session."
+    box_id = int(sess["current_box"])
+    orow = con.execute(
+        "SELECT is_active, slot_user_id, correct_order_json FROM order_rounds WHERE guild_id=? AND channel_id=? AND box_id=?",
+        (guild_id, channel_id, box_id),
+    ).fetchone()
+    if not orow or int(orow["is_active"]) != 1:
+        return "No active arrange question."
+    slot_user_id = int(orow["slot_user_id"])
+    if user_id != slot_user_id:
+        return "Only the current slot holder may answer."
 
+    correct = json.loads(orow["correct_order_json"])
+    submitted_indices = [ord(x) - 65 for x in letters]
+    turns = sum(1 for i in range(5) if submitted_indices[i] == correct[i])
+
+    con.execute(
+        "UPDATE order_rounds SET is_active=0 WHERE guild_id=? AND channel_id=? AND box_id=?",
+        (guild_id, channel_id, box_id),
+    )
+    con.execute(
+        "UPDATE slot_state SET turns_left=?, pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
+        (turns, guild_id, channel_id, box_id),
+    )
+    con.commit()
+    return box_id, turns
 async def post_boxes_leaderboard(channel: discord.TextChannel, guild_id: int, channel_id: int):
     con = db()
     try:
@@ -1158,6 +1261,7 @@ async def q_order(interaction: discord.Interaction):
 
 
 @wib.command(name="order", description="Slot holder submits the order (A B C D E).")
+@app_commands.default_permissions()
 @app_commands.describe(a="First", b="Second", c="Third", d="Fourth", e="Fifth")
 async def order(interaction: discord.Interaction, a: str, b: str, c: str, d: str, e: str):
     letters = [a, b, c, d, e]
@@ -1167,37 +1271,20 @@ async def order(interaction: discord.Interaction, a: str, b: str, c: str, d: str
 
     con = db()
     try:
-        sess = con.execute("SELECT * FROM sessions WHERE guild_id=? AND channel_id=?",
-                           (interaction.guild_id, interaction.channel_id)).fetchone()
-        if not sess or int(sess["is_locked"]) != 1:
-            return await interaction.response.send_message("No active locked session.", ephemeral=True)
-        box_id = int(sess["current_box"])
-        orow = con.execute(
-            "SELECT is_active, slot_user_id, correct_order_json FROM order_rounds WHERE guild_id=? AND channel_id=? AND box_id=?",
-            (interaction.guild_id, interaction.channel_id, box_id),
-        ).fetchone()
-        if not orow or int(orow["is_active"]) != 1:
-            return await interaction.response.send_message("No active arrange question.", ephemeral=True)
-        slot_user_id = int(orow["slot_user_id"])
-        if interaction.user.id != slot_user_id:
-            return await interaction.response.send_message("Only the current slot holder may answer.", ephemeral=True)
-
-        correct = json.loads(orow["correct_order_json"])
-        submitted_indices = [ord(x) - 65 for x in letters]
-        turns = sum(1 for i in range(5) if submitted_indices[i] == correct[i])
-
-        con.execute(
-            "UPDATE order_rounds SET is_active=0 WHERE guild_id=? AND channel_id=? AND box_id=?",
-            (interaction.guild_id, interaction.channel_id, box_id),
+        result = record_order_submission(
+            con,
+            interaction.guild_id,
+            interaction.channel_id,
+            interaction.user.id,
+            letters,
         )
-        con.execute(
-            "UPDATE slot_state SET turns_left=?, pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
-            (turns, interaction.guild_id, interaction.channel_id, box_id),
-        )
-        con.commit()
+        
     finally:
         con.close()
+    if isinstance(result, str):
+        return await interaction.response.send_message(result, ephemeral=True)
 
+    box_id, turns = result
     channel = interaction.channel
     if isinstance(channel, discord.TextChannel):
         await channel.send(embed=discord.Embed(
