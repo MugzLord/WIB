@@ -209,11 +209,13 @@ init_db()
 # Session-unique content generation (seeded)
 # -----------------------------
 
-NUMERIC_TEMPLATES = [
-    "Box {box}: Closest to the secret code between **{low}** and **{high}** wins. Submit an integer.",
-    "Box {box}: Hidden number challenge. Guess the number between **{low}** and **{high}**.",
-    "Box {box}: The vault code is a number from **{low}** to **{high}**. Closest answer wins.",
-    "Box {box}: Pick a number between **{low}** and **{high}**. Closest wins.",
+NUMERIC_QUESTION_BANK = [
+    ("Box {box}: How many days are in a week?", 7),
+    ("Box {box}: How many hours are in a day?", 24),
+    ("Box {box}: How many minutes are in an hour?", 60),
+    ("Box {box}: How many letters are in the English alphabet?", 26),
+    ("Box {box}: How many sides does a triangle have?", 3),
+    ("Box {box}: How many continents are there on Earth?", 7),
 ]
 
 ORDER_TEMPLATES = [
@@ -228,14 +230,8 @@ WORD_BANK_3 = ["AFTERNOON", "MORNING", "HORIZON", "PROMISE", "WHISPER", "GARDEN"
 
 def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
     rng = random.Random(seed * 100 + box_id * 7 + player_count)
-    tpl = rng.choice(NUMERIC_TEMPLATES)
-    span = rng.randint(50, 200)
-    base = rng.randint(20, 200)
-    low = base
-    high = base + span
-    ans = rng.randint(low, high)
-    q = tpl.format(box=box_id, low=low, high=high)
-    return q, int(ans)
+    template, answer = rng.choice(NUMERIC_QUESTION_BANK)
+    return template.format(box=box_id), int(answer)
 
 def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int]]:
     rng = random.Random(seed * 200 + box_id * 19)
@@ -908,7 +904,9 @@ async def wib_q(interaction: discord.Interaction):
         async def on_publish(pix: discord.Interaction):
             if pix.user.id != interaction.user.id:
                 return await pix.response.send_message("Only the host who generated this preview can publish it.", ephemeral=True)
-
+            if not pix.response.is_done():
+                await pix.response.defer(ephemeral=True)
+                
             con2 = db()
             try:
                 con2.execute(
@@ -944,18 +942,22 @@ async def wib_q(interaction: discord.Interaction):
             finally:
                 con3.close()
 
-            await pix.response.send_message("Published.", ephemeral=True)
+            await pix.followup.send("Published.", ephemeral=True)
 
         async def on_regen(rix: discord.Interaction):
             if rix.user.id != interaction.user.id:
                 return await rix.response.send_message("Only the host who generated this preview can regenerate it.", ephemeral=True)
+            if not rix.response.is_done():
+                await rix.response.defer(ephemeral=True)          
             await do_preview(rix, salt=random.randint(1, 99999), edit_response=True)
 
         async def on_cancel(cix: discord.Interaction):
             if cix.user.id != interaction.user.id:
                 return await cix.response.send_message("Only the host who generated this preview can cancel it.", ephemeral=True)
-            await cix.response.send_message("Cancelled.", ephemeral=True)
-
+            if not cix.response.is_done():
+                await cix.response.defer(ephemeral=True)
+            await cix.followup.send("Cancelled.", ephemeral=True)
+            
         view = PreviewPublishView(on_publish, on_regen, on_cancel)
         if edit_response or ix.response.is_done():
             await ix.edit_original_response(embed=emb, view=view)
