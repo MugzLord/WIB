@@ -1,4 +1,5 @@
 import os
+import asyncio
 import re
 import time
 import json
@@ -745,6 +746,37 @@ def compute_trivia_winner(con: sqlite3.Connection, guild_id: int, channel_id: in
         scored.append((diff, int(r["submitted_at_ms"]), int(r["user_id"])))
     scored.sort(key=lambda t: (t[0], t[1]))
     return scored[0][2]
+
+def compute_trivia_outcome(
+    con: sqlite3.Connection,
+    guild_id: int,
+    channel_id: int,
+    box_id: int,
+    correct: int,
+) -> Optional[Tuple[int, int, bool]]:
+    subs = con.execute(
+        """SELECT user_id, value_int, submitted_at_ms
+           FROM trivia_submissions
+           WHERE guild_id=? AND channel_id=? AND box_id=?""",
+        (guild_id, channel_id, box_id),
+    ).fetchall()
+    if not subs:
+        return None
+
+    exacts = [r for r in subs if int(r["value_int"]) == correct]
+    if exacts:
+        exacts.sort(key=lambda r: int(r["submitted_at_ms"]))
+        top = exacts[0]
+        return int(top["user_id"]), int(top["value_int"]), True
+
+    scored = []
+    for r in subs:
+        diff = abs(int(r["value_int"]) - correct)
+        scored.append((diff, int(r["submitted_at_ms"]), r))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    top = scored[0][2]
+    return int(top["user_id"]), int(top["value_int"]), False
+
 
 def compute_puzzle_position_score(correct_words: Tuple[str, str, str], guess_words: Tuple[str, str, str]) -> int:
     return sum(1 for i in range(3) if correct_words[i] == guess_words[i])
