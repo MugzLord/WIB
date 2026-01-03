@@ -869,7 +869,7 @@ async def wib_q(interaction: discord.Interaction):
     finally:
         con.close()
 
-    async def do_preview(ix: discord.Interaction, salt: int = 0):
+    async def do_preview(ix: discord.Interaction, salt: int = 0, edit_response: bool = False):
         q, ans = gen_numeric_question(seed + salt, box_id, pcount)
         emb = discord.Embed(title=f"Numeric Question Preview (Box {box_id})", description=q)
         emb.add_field(name="Answer (host only)", value=str(ans), inline=False)
@@ -918,8 +918,7 @@ async def wib_q(interaction: discord.Interaction):
         async def on_regen(rix: discord.Interaction):
             if rix.user.id != interaction.user.id:
                 return await rix.response.send_message("Only the host who generated this preview can regenerate it.", ephemeral=True)
-            await rix.response.defer(ephemeral=True)
-            await do_preview(rix, salt=random.randint(1, 99999))
+            await do_preview(rix, salt=random.randint(1, 99999), edit_response=True)
 
         async def on_cancel(cix: discord.Interaction):
             if cix.user.id != interaction.user.id:
@@ -927,8 +926,11 @@ async def wib_q(interaction: discord.Interaction):
             await cix.response.send_message("Cancelled.", ephemeral=True)
 
         view = PreviewPublishView(on_publish, on_regen, on_cancel)
-        await ix.response.send_message(embed=emb, view=view, ephemeral=True)
-
+        if edit_response or ix.response.is_done():
+            await ix.edit_original_response(embed=emb, view=view)
+        else:
+            await ix.response.send_message(embed=emb, view=view, ephemeral=True)
+            
     await do_preview(interaction, salt=random.randint(0, 9999))
 
 # Keep /wib num as fallback (button flow is primary)
@@ -1041,7 +1043,7 @@ async def q_order(interaction: discord.Interaction):
     finally:
         con.close()
 
-    async def do_preview(ix: discord.Interaction, salt: int = 0):
+    async def do_preview(ix: discord.Interaction, salt: int = 0, edit_response: bool = False):
         prompt, items, correct = gen_order_question(seed + salt, box_id)
         emb = discord.Embed(title=f"Arrange Question Preview (Box {box_id})", description=prompt)
         emb.add_field(name="Correct order (host only)", value=" ".join(chr(65+i) for i in correct), inline=False)
@@ -1084,9 +1086,8 @@ async def q_order(interaction: discord.Interaction):
         async def on_regen(rix: discord.Interaction):
             if rix.user.id != interaction.user.id:
                 return await rix.response.send_message("Only the host who generated this preview can regenerate it.", ephemeral=True)
-            await rix.response.defer(ephemeral=True)
-            await do_preview(rix, salt=random.randint(1, 99999))
-
+            await do_preview(rix, salt=random.randint(1, 99999), edit_response=True)
+            
         async def on_cancel(cix: discord.Interaction):
             if cix.user.id != interaction.user.id:
                 return await cix.response.send_message("Only the host who generated this preview can cancel it.", ephemeral=True)
@@ -1094,7 +1095,10 @@ async def q_order(interaction: discord.Interaction):
 
         view = PreviewPublishView(on_publish, on_regen, on_cancel)
         await ix.response.send_message(embed=emb, view=view, ephemeral=True)
-
+        if edit_response or ix.response.is_done():
+            await ix.edit_original_response(embed=emb, view=view)
+        else:
+            await ix.response.send_message(embed=emb, view=view, ephemeral=True)
     await do_preview(interaction, salt=random.randint(0, 9999))
 
 
