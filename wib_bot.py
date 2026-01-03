@@ -402,7 +402,7 @@ class NumericAnswerModal(discord.ui.Modal, title="Submit Answer"):
                 (self.guild_id, self.channel_id, self.box_id),
             ).fetchone()
             if not tr or int(tr["is_active"]) != 1:
-                return await interaction.response.send_message("No active numeric question right now.", ephemeral=True)
+                return await interaction.response.send_message("No active question right now.", ephemeral=True)
 
             existing = con.execute(
                 "SELECT 1 FROM trivia_submissions WHERE guild_id=? AND channel_id=? AND box_id=? AND user_id=?",
@@ -668,6 +668,7 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
 class WIB(app_commands.Group):
     def __init__(self):
         super().__init__(name="wib", description="What's in the Box controls")
@@ -851,7 +852,8 @@ async def lock(interaction: discord.Interaction):
     await interaction.response.send_message(f"Entries locked. Registered players: **{pcount}**.\nSession seed locked.")
 
 
-@bot.tree.command(name="wib_q", description="Preview a numeric question for the current box.")
+@bot.tree.command(name="wib_q", description="Preview a question for the current box.")
+@app_commands.default_permissions(administrator=True)
 @app_commands.guild_only()
 async def wib_q(interaction: discord.Interaction):
     # --- this is the SAME body as your existing /wib q_numeric ---
@@ -871,7 +873,7 @@ async def wib_q(interaction: discord.Interaction):
 
     async def do_preview(ix: discord.Interaction, salt: int = 0, edit_response: bool = False):
         q, ans = gen_numeric_question(seed + salt, box_id, pcount)
-        emb = discord.Embed(title=f"Numeric Question Preview (Box {box_id})", description=q)
+        emb = discord.Embed(title=f"Question Preview (Box {box_id})", description=q)
         emb.add_field(name="Answer (host only)", value=str(ans), inline=False)
 
         async def on_publish(pix: discord.Interaction):
@@ -897,7 +899,7 @@ async def wib_q(interaction: discord.Interaction):
 
             msg = await pix.channel.send(
                 embed=discord.Embed(
-                    title=f"Box {box_id} — Numeric Question",
+                    title=f"Box {box_id} — Question",
                     description=f"{q}\n\nClick **Answer** to submit.\n(Registered players only. First submission counts.)"
                 ),
                 view=NumericAnswerView(pix.guild_id, pix.channel_id, box_id)
@@ -934,8 +936,8 @@ async def wib_q(interaction: discord.Interaction):
     await do_preview(interaction, salt=random.randint(0, 9999))
 
 # Keep /wib num as fallback (button flow is primary)
-@wib.command(name="num", description="(Fallback) Submit your numeric answer for the active question.")
-@app_commands.describe(value="Your numeric answer")
+@wib.command(name="num", description="(Fallback) Submit your answer for the active question.")
+@app_commands.describe(value="Your answer")
 async def num(interaction: discord.Interaction, value: int):
     con = db()
     try:
@@ -952,7 +954,7 @@ async def num(interaction: discord.Interaction, value: int):
             (interaction.guild_id, interaction.channel_id, box_id),
         ).fetchone()
         if not tr or int(tr["is_active"]) != 1:
-            return await interaction.response.send_message("No active numeric question right now.", ephemeral=True)
+            return await interaction.response.send_message("No active question right now.", ephemeral=True)
 
         existing = con.execute(
             "SELECT 1 FROM trivia_submissions WHERE guild_id=? AND channel_id=? AND box_id=? AND user_id=?",
@@ -973,7 +975,7 @@ async def num(interaction: discord.Interaction, value: int):
     await interaction.response.send_message("Submitted.", ephemeral=True)
 
 
-@wib.command(name="reveal", description="Host: reveal numeric winner and assign slot.")
+@wib.command(name="reveal", description="Host: reveal winner and assign slot.")
 async def reveal(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not has_host_role(interaction.user):
         return await interaction.response.send_message("Host permission required.", ephemeral=True)
@@ -990,7 +992,7 @@ async def reveal(interaction: discord.Interaction):
             (interaction.guild_id, interaction.channel_id, box_id),
         ).fetchone()
         if not tr or int(tr["is_active"]) != 1:
-            return await interaction.response.send_message("No active numeric question.", ephemeral=True)
+            return await interaction.response.send_message("No active question.", ephemeral=True)
 
         correct = int(tr["answer_int"])
         winner_id = compute_trivia_winner(con, interaction.guild_id, interaction.channel_id, box_id, correct)
@@ -1094,11 +1096,11 @@ async def q_order(interaction: discord.Interaction):
             await cix.response.send_message("Cancelled.", ephemeral=True)
 
         view = PreviewPublishView(on_publish, on_regen, on_cancel)
-        await ix.response.send_message(embed=emb, view=view, ephemeral=True)
         if edit_response or ix.response.is_done():
             await ix.edit_original_response(embed=emb, view=view)
         else:
             await ix.response.send_message(embed=emb, view=view, ephemeral=True)
+            
     await do_preview(interaction, salt=random.randint(0, 9999))
 
 
