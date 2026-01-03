@@ -5,6 +5,8 @@ import time
 import json
 import sqlite3
 import random
+import urllib.error
+import urllib.request
 from typing import Dict, List, Optional, Tuple
 
 import discord
@@ -18,6 +20,7 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "")
 DB_PATH = os.getenv("DB_PATH", "./wib.db")
 HOST_ROLE_NAME = (os.getenv("HOST_ROLE_NAME", "") or "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN in environment.")
@@ -209,14 +212,6 @@ init_db()
 # Session-unique content generation (seeded)
 # -----------------------------
 
-NUMERIC_QUESTION_BANK = [
-    ("Box {box}: How many days are in a week?", 7),
-    ("Box {box}: How many hours are in a day?", 24),
-    ("Box {box}: How many minutes are in an hour?", 60),
-    ("Box {box}: How many letters are in the English alphabet?", 26),
-    ("Box {box}: How many sides does a triangle have?", 3),
-    ("Box {box}: How many continents are there on Earth?", 7),
-]
 
 ORDER_TEMPLATES = [
     "Arrange these five deliveries from earliest to latest (1 to 5):",
@@ -228,10 +223,53 @@ WORD_BANK_1 = ["ONE", "SILVER", "MIDNIGHT", "BRIGHT", "HIDDEN", "GOLDEN", "QUIET
 WORD_BANK_2 = ["FINE", "STILL", "COLD", "TRUE", "SMALL", "WILD", "GREEN", "DARK", "CLEAR", "LAST", "SWEET", "SHARP"]
 WORD_BANK_3 = ["AFTERNOON", "MORNING", "HORIZON", "PROMISE", "WHISPER", "GARDEN", "LANTERN", "SUNRISE", "MOONLIGHT", "COMPASS", "VICTORY", "FIRELIGHT"]
 
-def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
-    rng = random.Random(seed * 100 + box_id * 7 + player_count)
-    template, answer = rng.choice(NUMERIC_QUESTION_BANK)
-    return template.format(box=box_id), int(answer)
+def _parse_openai_question(payload: dict) -> Tuple[str, int]:
+    outputs = payload.get("output", [])
+    text = ""
+    for output in outputs:
+        for content in output.get("content", []):
+            if content.get("type") == "output_text":
+                text += content.get("text", "")
+    data = json.loads(text or "{}")
+    question = str(data.get("question", "")).strip()
+    answer = data.get("answer", None)
+    if not question or not isinstance(answer, int):
+        raise ValueError("OpenAI response missing numeric question/answer.")
+    return question, answer
+
+def _fetch_openai_numeric_question(seed: int) -> Tuple[str, int]:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY in environment.")
+
+    prompt = (
+        "Return JSON only: {\"question\":\"...\",\"answer\":number}.\n"
+        "Make a very simple, kid-friendly trivia question whose answer is a whole number.\n"
+        "Keep it short and avoid math riddles. The answer must be an integer.\n"
+        f"Seed: {seed}"
+    )
+    body = json.dumps({
+        "model": "gpt-4o-mini",
+        "input": prompt,
+        "temperature": 0.4,
+        "max_output_tokens": 120,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = json.load(resp)
+    return _parse_openai_question(payload)
+
+async def generate_numeric_question_async(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
+    q, ans = await asyncio.to_thread(_fetch_openai_numeric_question, seed + box_id * 7 + player_count)
+    return f"Box {box_id}: {q}", int(ans)
 
 def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int]]:
     rng = random.Random(seed * 200 + box_id * 19)
@@ -491,7 +529,6 @@ class OrderAnswerView(discord.ui.View):
     @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:order_answer")
     async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(OrderAnswerModal(self.guild_id, self.channel_id, self.box_id))
-
 
 
 class PuzzleModal(discord.ui.Modal, title="Submit Puzzle"):
