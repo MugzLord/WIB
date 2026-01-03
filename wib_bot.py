@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   current_box INTEGER NOT NULL DEFAULT 1,
   opened_boxes_count INTEGER NOT NULL DEFAULT 0,
   eliminations_unlocked INTEGER NOT NULL DEFAULT 0,
+  lobby_msg_id INTEGER,
   created_at_ms INTEGER NOT NULL,
   PRIMARY KEY (guild_id, channel_id)
 );
@@ -192,6 +193,10 @@ def init_db():
     con = db()
     try:
         con.executescript(SCHEMA)
+        try:
+            con.execute("ALTER TABLE sessions ADD COLUMN lobby_msg_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
         con.commit()
     finally:
         con.close()
@@ -298,11 +303,12 @@ def gen_phrase_and_deck(seed: int, box_id: int) -> Tuple[Tuple[str, str, str], L
 # -----------------------------
 
 class JoinView(discord.ui.View):
-    def __init__(self, bot: commands.Bot, guild_id: int, channel_id: int):
+    def __init__(self, bot: commands.Bot, guild_id: int, channel_id: int, locked: bool = False):
         super().__init__(timeout=None)
         self.bot = bot
         self.guild_id = guild_id
         self.channel_id = channel_id
+        self.join_button.disabled = locked
 
     @discord.ui.button(label="Join", style=discord.ButtonStyle.success, custom_id="wib:join")
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -799,12 +805,24 @@ async def lobby(interaction: discord.Interaction):
     view = JoinView(bot, interaction.guild_id, interaction.channel_id)
     emb = discord.Embed(title="Session Registration", description="Click **Join** to register for this session.\nHost will lock entries when ready.")
     await interaction.response.send_message(embed=emb, view=view)
+    msg = await interaction.original_response()
+
+    con = db()
+    try:
+        con.execute(
+            "UPDATE sessions SET lobby_msg_id=? WHERE guild_id=? AND channel_id=?",
+            (msg.id, interaction.guild_id, interaction.channel_id),
+        )
+        con.commit()
+    finally:
+        con.close()
 
 @wib.command(name="lock", description="Lock session entries (one-time).")
 async def lock(interaction: discord.Interaction):
     if not isinstance(interaction.user, discord.Member) or not has_host_role(interaction.user):
         return await interaction.response.send_message("Host permission required.", ephemeral=True)
 
+    lobby_msg_id = None
     con = db()
     try:
         sess = ensure_session(con, interaction.guild_id, interaction.channel_id)
@@ -817,9 +835,19 @@ async def lock(interaction: discord.Interaction):
         con.commit()
         seed = int(sess["session_seed"])
         pcount = get_participant_count(con, interaction.guild_id, interaction.channel_id)
+        lobby_msg_id = sess["lobby_msg_id"]
         ensure_box_secret(con, interaction.guild_id, interaction.channel_id, seed, 1)
     finally:
         con.close()
+
+    if lobby_msg_id:
+        channel = interaction.channel
+        if isinstance(channel, discord.TextChannel):
+            try:
+                msg = await channel.fetch_message(int(lobby_msg_id))
+                await msg.edit(view=JoinView(bot, interaction.guild_id, interaction.channel_id, locked=True))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
     await interaction.response.send_message(f"Entries locked. Registered players: **{pcount}**.\nSession seed locked.")
 
@@ -1039,8 +1067,7 @@ async def q_order(interaction: discord.Interaction):
 
             msg = await pix.channel.send(embed=discord.Embed(
                 title=f"Box {box_id} — Arrange Question",
-                description=f"{prompt}\n\n "Only the slot holder may answer using **/wib order A B C D E**."
-
+                description=f"{prompt}\n\nOnly the slot holder may answer using **/wib order A B C D E**."
             ))
             con3 = db()
             try:
