@@ -290,7 +290,7 @@ def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int
     else:
         sorted_pairs = sorted(list(enumerate(values)), key=lambda x: x[1])
     correct_indices = [idx for idx, _ in sorted_pairs]
-    prompt = f"Box {box_id}: {mode}\n" + "\n".join(items) + "\n\nSubmit with: /wib order A B C D E"
+    prompt = f"Box {box_id}: {mode}\n" + "\n".join(items) + "\n\nUse the Answer button to submit."
     return prompt, items, correct_indices
 
 def gen_phrase_and_deck(seed: int, box_id: int) -> Tuple[Tuple[str, str, str], List[dict]]:
@@ -530,10 +530,20 @@ class OrderAnswerView(discord.ui.View):
         self.channel_id = channel_id
         self.box_id = box_id
 
-    @discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:order_answer")
-    async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(OrderAnswerModal(self.guild_id, self.channel_id, self.box_id))
+    #@discord.ui.button(label="Answer", style=discord.ButtonStyle.primary, custom_id="wib:order_answer")
+    #async def answer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        con = db()
+        try:
+            row = con.execute(
+                "SELECT slot_user_id FROM slot_state WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (self.guild_id, self.channel_id, self.box_id),
+            ).fetchone()
+        finally:
+            con.close()
 
+        if not row or row["slot_user_id"] is None or int(row["slot_user_id"]) != interaction.user.id:    
+        await interaction.response.send_modal(OrderAnswerModal(self.guild_id, self.channel_id, self.box_id))
 
 class PuzzleModal(discord.ui.Modal, title="Submit Puzzle"):
     w1 = discord.ui.TextInput(label="Word 1", placeholder="FIRST WORD", max_length=32)
