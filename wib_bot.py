@@ -1039,7 +1039,7 @@ async def q_order(interaction: discord.Interaction):
 
             msg = await pix.channel.send(embed=discord.Embed(
                 title=f"Box {box_id} — Arrange Question",
-                description=f"{prompt}\n\n "Only the slot holder may answer using **/wib order A B C D E**."
+                description=f"{prompt}\n\nOnly the slot holder may answer using **/wib order A B C D E**."
 
             ))
             con3 = db()
