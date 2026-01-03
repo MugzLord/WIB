@@ -274,6 +274,38 @@ async def generate_numeric_question_async(seed: int, box_id: int, player_count: 
     q, ans = await asyncio.to_thread(_fetch_openai_numeric_question, seed + box_id * 7 + player_count)
     return f"Box {box_id}: {q}", int(ans)
 
+def _fetch_openai_banter(prompt: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY in environment.")
+
+    body = json.dumps({
+        "model": "gpt-4o-mini",
+        "input": prompt,
+        "temperature": 0.7,
+        "max_output_tokens": 60,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = json.load(resp)
+    outputs = payload.get("output", [])
+    for output in outputs:
+        for content in output.get("content", []):
+            if content.get("type") == "output_text":
+                return (content.get("text") or "").strip()
+    raise ValueError("OpenAI response missing banter text.")
+
+async def generate_banter_async(prompt: str) -> str:
+    return await asyncio.to_thread(_fetch_openai_banter, prompt)
+
 def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int]]:
     rng = random.Random(seed * 200 + box_id * 19)
     mode = rng.choice(ORDER_TEMPLATES)
@@ -1226,10 +1258,25 @@ async def reveal(interaction: discord.Interaction):
 
     winner_value = outcome[1] if outcome else None
     was_exact = outcome[2] if outcome else False
+    banter_prompt = (
+        "Write a short, playful one-liner for a game host. Keep it friendly, non-toxic, "
+        "and under 12 words."
+    )
+    try:
+        banter = await generate_banter_async(banter_prompt)
+    except (RuntimeError, ValueError, urllib.error.URLError):
+        banter = "Nice hustle—keep the guesses coming!"
+
     if was_exact:
-        result_line = f"{winner_mention} got it exactly right with **{winner_value}** and was the fastest."
+        result_line = (
+            f"{winner_mention} got it exactly right with **{winner_value}** and was the fastest. "
+            f"{banter}"
+        )
     else:
-        result_line = f"No exact answers. {winner_mention} was closest with **{winner_value}** and fastest."
+        result_line = (
+            f"No exact answers. {winner_mention} was closest and fastest with **{winner_value}**. "
+            f"{banter}"
+        )
 
     await interaction.followup.send(embed=discord.Embed(
         title=f"Box {box_id} — Winner",
