@@ -718,16 +718,13 @@ class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
         self.box_id = box_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        raw = str(self.order).strip().upper()
-        # allow: "A B C D E" or "ABCDE" or "A,B,C,D,E"
-        raw = re.sub(r"[^A-E]", "", raw)
-
-        if len(raw) != 5:
-            return await interaction.response.send_message(
-                "Invalid order. Enter exactly 5 letters using A–E (e.g., A B C D E).",
-                ephemeral=True
-            )
-
+        letters = [
+            self.a.value or "",
+            self.b.value or "",
+            self.c.value or "",
+            self.d.value or "",
+            self.e.value or "",
+        ]
         letters = list(raw)
         if sorted(letters) != ["A", "B", "C", "D", "E"]:
             return await interaction.response.send_message(
