@@ -1393,17 +1393,32 @@ async def wib_q(interaction: discord.Interaction):
                 embed=None,
                 view=None,
             )
+        last_q = con.execute(
+            "SELECT q_text FROM trivia_rounds WHERE guild_id=? AND channel_id=? AND box_id=?",
+            (interaction.guild_id, interaction.channel_id, box_id),
+        ).fetchone()
+        last_q_text = (last_q["q_text"] if last_q else "") or ""
         seed = int(sess["session_seed"])
         pcount = get_participant_count(con, interaction.guild_id, interaction.channel_id)
     finally:
         con.close()
 
     async def do_preview(salt: int = 0):
-        try:
-            q, ans = await generate_numeric_question_async(seed + salt, box_id, pcount)
-        except Exception:
+        q = None
+        ans = None
+        for attempt in range(3):
+            try:
+                q, ans = await generate_numeric_question_async(seed + salt + attempt, box_id, pcount)
+            except Exception:
+                q = None
+                continue
+            if q and q.strip() and q.strip() != last_q_text.strip():
+                break
+            q = None
+
+        if not q:
             return await interaction.edit_original_response(
-                content="Failed to generate a valid question. Try again.",
+                content="Failed to generate a new question. Try again.",
                 embed=None,
                 view=None,
             )
