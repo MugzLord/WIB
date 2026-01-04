@@ -847,41 +847,41 @@ class CardPickView(discord.ui.View):
         self._build_buttons()
 
     def _build_buttons(self):
-    con = db()
-    try:
-        row = con.execute(
-            "SELECT deck_json, revealed_json, phrase_w1, phrase_w2, phrase_w3 FROM box_secrets WHERE guild_id=? AND channel_id=? AND box_id=?",
-            (self.guild_id, self.channel_id, self.box_id),
-        ).fetchone()
-        if not row:
-            return
-
-        deck = json.loads(row["deck_json"])
-        revealed = set(json.loads(row["revealed_json"]))
-
-        w1, w2, w3 = row["phrase_w1"], row["phrase_w2"], row["phrase_w3"]
-    finally:
-        con.close()
-
-    def label_for(idx: int) -> str:
-        if idx not in revealed:
-            return f"Card {idx+1}"
-
-        card = deck[idx]
-        ctype = card.get("type", "CARD")
-
-        if ctype == "PIECE":
-            reveal = card.get("reveal")
-            word = w1 if reveal == "W1" else (w2 if reveal == "W2" else w3)
-            return word  # shows the actual word on the card
-
-        # PASS / STEAL / DONATE / WILDCARD etc
-        return str(ctype).upper()
-
-    self.clear_items()
-    for idx in range(len(deck)):
-        disabled = (idx in revealed)
-        self.add_item(CardButton(idx=idx, disabled=disabled, label_text=label_for(idx)))
+        con = db()
+        try:
+            row = con.execute(
+                "SELECT deck_json, revealed_json, phrase_w1, phrase_w2, phrase_w3 FROM box_secrets WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (self.guild_id, self.channel_id, self.box_id),
+            ).fetchone()
+            if not row:
+                return
+    
+            deck = json.loads(row["deck_json"])
+            revealed = set(json.loads(row["revealed_json"]))
+    
+            w1, w2, w3 = row["phrase_w1"], row["phrase_w2"], row["phrase_w3"]
+        finally:
+            con.close()
+    
+        def label_for(idx: int) -> str:
+            if idx not in revealed:
+                return f"Card {idx+1}"
+    
+            card = deck[idx]
+            ctype = card.get("type", "CARD")
+    
+            if ctype == "PIECE":
+                reveal = card.get("reveal")
+                word = w1 if reveal == "W1" else (w2 if reveal == "W2" else w3)
+                return word  # shows the actual word on the card
+    
+            # PASS / STEAL / DONATE / WILDCARD etc
+            return str(ctype).upper()
+    
+        self.clear_items()
+        for idx in range(len(deck)):
+            disabled = (idx in revealed)
+            self.add_item(CardButton(idx=idx, disabled=disabled, label_text=label_for(idx)))
 
 
     async def refresh_and_edit(self, message: discord.Message):
