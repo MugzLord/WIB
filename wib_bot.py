@@ -378,42 +378,39 @@ def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int
 
 def gen_phrase_and_deck(seed: int, box_id: int) -> Tuple[Tuple[str, str, str], List[dict]]:
     rng = random.Random(seed * 300 + box_id * 31)
+
+    # Phrase (host-only truth)
     w1 = rng.choice(WORD_BANK_1)
     w2 = rng.choice(WORD_BANK_2)
     w3 = rng.choice(WORD_BANK_3)
     phrase = (w1, w2, w3)
 
     deck: List[dict] = []
+
+    # EXACTLY ONE PIECE PER WORD (NO DUPLICATES)
     deck.append({"type": "PIECE", "reveal": "W1"})
     deck.append({"type": "PIECE", "reveal": "W2"})
     deck.append({"type": "PIECE", "reveal": "W3"})
 
     remaining = 7
+
     if box_id == 1:
-        for _ in range(remaining):
-            t = rng.choices(["PIECE", "PASS"], weights=[7, 3])[0]
-            if t == "PIECE":
-                deck.append({"type": "PIECE", "reveal": rng.choice(["W1", "W2", "W3"])})
-            else:
-                deck.append({"type": "PASS"})
+        pool = ["PASS"]
+        weights = [1]
+
     elif 2 <= box_id <= 5:
-        for _ in range(remaining):
-            t = rng.choices(["PIECE", "PASS", "STEAL"], weights=[6, 2, 2])[0]
-            if t == "PIECE":
-                deck.append({"type": "PIECE", "reveal": rng.choice(["W1", "W2", "W3"])})
-            else:
-                deck.append({"type": t})
-    else:
-        for _ in range(remaining):
-            t = rng.choices(["PIECE", "PASS", "STEAL", "DONATE", "WILDCARD"], weights=[5, 2, 2, 2, 1])[0]
-            if t == "PIECE":
-                deck.append({"type": "PIECE", "reveal": rng.choice(["W1", "W2", "W3"])})
-            else:
-                deck.append({"type": t})
+        pool = ["PASS", "STEAL"]
+        weights = [1, 1]
+
+    else:  # MEGA BOX (6)
+        pool = ["PASS", "STEAL", "DONATE", "WILDCARD"]
+        weights = [1, 1, 1, 1]
+
+    for _ in range(remaining):
+        deck.append({"type": rng.choices(pool, weights=weights)[0]})
 
     rng.shuffle(deck)
     return phrase, deck
-
 
 # -----------------------------
 # Discord UI Components
@@ -1049,9 +1046,12 @@ class CardButton(discord.ui.Button):
         finally:
             con.close()
 
+        # Always re-render the card grid immediately (flip to word/PASS/etc)
         try:
-            if isinstance(interaction.message, discord.Message) and isinstance(interaction.view, CardPickView):
-                await interaction.view.refresh_and_edit(interaction.message)
+            if isinstance(interaction.message, discord.Message):
+                await interaction.message.edit(
+                    view=CardPickView(guild_id, channel_id, box_id)
+                )
         except Exception:
             pass
 
@@ -1291,6 +1291,52 @@ async def post_boxes_leaderboard(channel: discord.TextChannel, guild_id: int, ch
     finally:
         con.close()
 
+@wib.command(name="puzzle_status", description="Host: view the hidden phrase + what is revealed so far (ephemeral).")
+async def puzzle_status(interaction: discord.Interaction):
+    if not isinstance(interaction.user, discord.Member) or not has_host_role(interaction.user):
+        return await interaction.response.send_message("Host permission required.", ephemeral=True)
+
+    con = db()
+    try:
+        sess = con.execute(
+            "SELECT session_seed, current_box FROM sessions WHERE guild_id=? AND channel_id=?",
+            (interaction.guild_id, interaction.channel_id),
+        ).fetchone()
+        if not sess:
+            return await interaction.response.send_message("No session.", ephemeral=True)
+
+        box_id = int(sess["current_box"])
+        sec = con.execute(
+            "SELECT theme, phrase_w1, phrase_w2, phrase_w3, deck_json, revealed_json "
+            "FROM box_secrets WHERE guild_id=? AND channel_id=? AND box_id=?",
+            (interaction.guild_id, interaction.channel_id, box_id),
+        ).fetchone()
+        if not sec:
+            return await interaction.response.send_message("Box secret not found.", ephemeral=True)
+
+        phrase = f"{sec['phrase_w1']} {sec['phrase_w2']} {sec['phrase_w3']}"
+        deck = json.loads(sec["deck_json"])
+        revealed = set(json.loads(sec["revealed_json"]))
+
+        # show revealed card labels (index + type/reveal)
+        shown = []
+        for i in sorted(revealed):
+            c = deck[i]
+            if c["type"] == "PIECE":
+                shown.append(f"Card {i+1}: PIECE({c.get('reveal')})")
+            else:
+                shown.append(f"Card {i+1}: {c['type']}")
+        shown_text = "\n".join(shown) if shown else "None yet."
+
+        emb = discord.Embed(
+            title=f"Host Puzzle Status (Box {box_id})",
+            description=f"Theme: **{sec['theme']}**\nCorrect phrase: **{phrase}**",
+        )
+        emb.add_field(name="Revealed cards", value=shown_text[:1024], inline=False)
+    finally:
+        con.close()
+
+    await interaction.response.send_message(embed=emb, ephemeral=True)
 
 @wib.command(name="lobby", description="Open the session lobby (one-time) with Join button.")
 async def lobby(interaction: discord.Interaction):
