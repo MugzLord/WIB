@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS box_secrets (
   guild_id INTEGER NOT NULL,
   channel_id INTEGER NOT NULL,
   box_id INTEGER NOT NULL,
+  theme TEXT NOT NULL,
   phrase_w1 TEXT NOT NULL,
   phrase_w2 TEXT NOT NULL,
   phrase_w3 TEXT NOT NULL,
@@ -220,6 +221,12 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+        # NEW: theme per box
+        try:
+            con.execute("ALTER TABLE box_secrets ADD COLUMN theme TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
         con.commit()
     finally:
         con.close()
@@ -240,6 +247,28 @@ ORDER_TEMPLATES = [
 WORD_BANK_1 = ["ONE", "SILVER", "MIDNIGHT", "BRIGHT", "HIDDEN", "GOLDEN", "QUIET", "FIRST", "SOFT", "BLUE", "CRISP", "FAIR"]
 WORD_BANK_2 = ["FINE", "STILL", "COLD", "TRUE", "SMALL", "WILD", "GREEN", "DARK", "CLEAR", "LAST", "SWEET", "SHARP"]
 WORD_BANK_3 = ["AFTERNOON", "MORNING", "HORIZON", "PROMISE", "WHISPER", "GARDEN", "LANTERN", "SUNRISE", "MOONLIGHT", "COMPASS", "VICTORY", "FIRELIGHT"]
+
+BOX_THEMES = [
+    "Mystery Market",
+    "Neon Arcade",
+    "Hidden Treasures",
+    "Cosmic Quest",
+    "Jungle Expedition",
+    "Ocean Secrets",
+    "Retro Roadtrip",
+    "Skyline Chase",
+    "Midnight Heist",
+    "Festival Lights",
+    "Frozen Frontier",
+    "Wild West",
+]
+
+def get_box_theme(seed: int, box_id: int) -> str:
+    rng = random.Random(seed + 404)
+    themes = BOX_THEMES[:]
+    rng.shuffle(themes)
+    idx = (box_id - 1) % len(themes)
+    return themes[idx]
 
 def _parse_openai_question(payload: dict) -> Tuple[str, int]:
     outputs = payload.get("output", [])
@@ -463,6 +492,84 @@ class PassButtonsView(discord.ui.View):
         # Disable after timeout to prevent stale clicks
         for child in self.children:
             child.disabled = True
+class NextBoxSelect(discord.ui.Select):
+    def __init__(
+        self,
+        options: List[discord.SelectOption],
+        slot_user_id: int,
+        guild_id: int,
+        channel_id: int,
+        opened_box_id: int,
+        session_seed: int,
+    ):
+        super().__init__(placeholder="Select next box to open", min_values=1, max_values=1, options=options)
+        self.slot_user_id = slot_user_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.opened_box_id = opened_box_id
+        self.session_seed = session_seed
+
+    async def callback(self, ix: discord.Interaction):
+        await ix.response.defer(ephemeral=True)
+        if ix.user.id != self.slot_user_id:
+            return await ix.followup.send("Only the slot holder can choose the next box.", ephemeral=True)
+
+        chosen_box = int(self.values[0])
+        con = db()
+        try:
+            sess = con.execute(
+                "SELECT session_seed FROM sessions WHERE guild_id=? AND channel_id=?",
+                (self.guild_id, self.channel_id),
+            ).fetchone()
+            if not sess:
+                return await ix.followup.send("No active session.", ephemeral=True)
+
+            ensure_box_secret(con, self.guild_id, self.channel_id, int(sess["session_seed"]), chosen_box)
+            con.execute(
+                "UPDATE sessions SET current_box=? WHERE guild_id=? AND channel_id=?",
+                (chosen_box, self.guild_id, self.channel_id),
+            )
+            con.execute(
+                "UPDATE slot_state SET pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (self.guild_id, self.channel_id, self.opened_box_id),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        for child in self.view.children:
+            child.disabled = True
+        try:
+            await ix.message.edit(view=self.view)
+        except Exception:
+            pass
+
+        theme = get_box_theme(self.session_seed, chosen_box)
+        if isinstance(ix.channel, discord.TextChannel):
+            await ix.channel.send(embed=discord.Embed(
+                title="Next Box Selected",
+                description=(
+                    f"Slot holder chose **Box {chosen_box}**.\n"
+                    f"Theme: **{theme}**\n\n"
+                    "Host: return to **/wib_q**."
+                )
+            ))
+        await ix.followup.send("Done.", ephemeral=True)
+
+
+class NextBoxView(discord.ui.View):
+    def __init__(
+        self,
+        options: List[discord.SelectOption],
+        slot_user_id: int,
+        guild_id: int,
+        channel_id: int,
+        opened_box_id: int,
+        session_seed: int,
+    ):
+        super().__init__(timeout=300)
+        self.add_item(NextBoxSelect(options, slot_user_id, guild_id, channel_id, opened_box_id, session_seed))
+
 
 class JoinView(discord.ui.View):
     def __init__(self, bot: commands.Bot, guild_id: int, channel_id: int, locked: bool = False):
@@ -598,11 +705,11 @@ class NumericAnswerView(discord.ui.View):
 
 
 class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
-    a = discord.ui.TextInput(label="First", placeholder="A-E", max_length=1)
-    b = discord.ui.TextInput(label="Second", placeholder="A-E", max_length=1)
-    c = discord.ui.TextInput(label="Third", placeholder="A-E", max_length=1)
-    d = discord.ui.TextInput(label="Fourth", placeholder="A-E", max_length=1)
-    e = discord.ui.TextInput(label="Fifth", placeholder="A-E", max_length=1)
+    order = discord.ui.TextInput(
+        label="Order",
+        placeholder="Example: A B C D E (or ABCDE)",
+        max_length=32
+    )
 
     def __init__(self, guild_id: int, channel_id: int, box_id: int):
         super().__init__()
@@ -611,10 +718,22 @@ class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
         self.box_id = box_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        letters = [str(self.a), str(self.b), str(self.c), str(self.d), str(self.e)]
-        letters = [x.strip().upper() for x in letters]
+        raw = str(self.order).strip().upper()
+        # allow: "A B C D E" or "ABCDE" or "A,B,C,D,E"
+        raw = re.sub(r"[^A-E]", "", raw)
+
+        if len(raw) != 5:
+            return await interaction.response.send_message(
+                "Invalid order. Enter exactly 5 letters using A–E (e.g., A B C D E).",
+                ephemeral=True
+            )
+
+        letters = list(raw)
         if sorted(letters) != ["A", "B", "C", "D", "E"]:
-            return await interaction.response.send_message("Invalid order. Use each of A B C D E exactly once.", ephemeral=True)
+            return await interaction.response.send_message(
+                "Invalid order. Use each of A B C D E exactly once.",
+                ephemeral=True
+            )
 
         con = db()
         try:
@@ -991,16 +1110,24 @@ def is_registered(con: sqlite3.Connection, guild_id: int, channel_id: int, user_
 
 def ensure_box_secret(con: sqlite3.Connection, guild_id: int, channel_id: int, seed: int, box_id: int):
     row = con.execute(
-        "SELECT 1 FROM box_secrets WHERE guild_id=? AND channel_id=? AND box_id=?",
+        "SELECT theme FROM box_secrets WHERE guild_id=? AND channel_id=? AND box_id=?",
         (guild_id, channel_id, box_id),
     ).fetchone()
     if row:
+        if not (row["theme"] or "").strip():
+            theme = get_box_theme(seed, box_id)
+            con.execute(
+                "UPDATE box_secrets SET theme=? WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (theme, guild_id, channel_id, box_id),
+            )
+            con.commit()
         return
     phrase, deck = gen_phrase_and_deck(seed, box_id)
+    theme = get_box_theme(seed, box_id)
     con.execute(
-        """INSERT INTO box_secrets (guild_id, channel_id, box_id, phrase_w1, phrase_w2, phrase_w3, deck_json, revealed_json, created_at_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (guild_id, channel_id, box_id, phrase[0], phrase[1], phrase[2], json.dumps(deck), json.dumps([]), now_ms()),
+        """INSERT INTO box_secrets (guild_id, channel_id, box_id, theme, phrase_w1, phrase_w2, phrase_w3, deck_json, revealed_json, created_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (guild_id, channel_id, box_id, theme, phrase[0], phrase[1], phrase[2], json.dumps(deck), json.dumps([]), now_ms()),
     )
     con.execute(
         """INSERT OR IGNORE INTO slot_state (guild_id, channel_id, box_id, slot_user_id, turns_left, pending_action, pending_msg_id)
@@ -1259,6 +1386,16 @@ async def wib_q(interaction: discord.Interaction):
             )
 
         box_id = int(sess["current_box"])
+        slot = con.execute(
+            "SELECT pending_action FROM slot_state WHERE guild_id=? AND channel_id=? AND box_id=?",
+            (interaction.guild_id, interaction.channel_id, box_id),
+        ).fetchone()
+        if slot and slot["pending_action"] == "CHOOSE_BOX":
+            return await interaction.edit_original_response(
+                content="Waiting for the slot holder to choose the next box.",
+                embed=None,
+                view=None,
+            )
         seed = int(sess["session_seed"])
         pcount = get_participant_count(con, interaction.guild_id, interaction.channel_id)
     finally:
@@ -1273,10 +1410,10 @@ async def wib_q(interaction: discord.Interaction):
                 embed=None,
                 view=None,
             )
-
+        theme = get_box_theme(seed, box_id)
         emb = discord.Embed(
             title=f"Question Preview (Box {box_id})",
-            description=q
+            description=f"Theme: **{theme}**\n{q}"
         )
         emb.add_field(
             name="Answer (host only)",
@@ -1327,7 +1464,7 @@ async def wib_q(interaction: discord.Interaction):
                 embed=discord.Embed(
                     title=f"Box {box_id} — Question",
                     description=(
-                        f"{q}\n\n"
+                        f"Theme: **{theme}**\n{q}\n\n"
                         "Click **Answer** to submit.\n"
                         "(Registered players only. First submission counts.)"
                     ),
@@ -1509,7 +1646,11 @@ async def q_order(interaction: discord.Interaction):
 
     async def do_preview(ix: discord.Interaction, salt: int = 0, edit_response: bool = False):
         prompt, items, correct = gen_order_question(seed + salt, box_id)
-        emb = discord.Embed(title=f"Arrange Question Preview (Box {box_id})", description=prompt)
+        theme = get_box_theme(seed, box_id)
+        emb = discord.Embed(
+            title=f"Arrange Question Preview (Box {box_id})",
+            description=f"Theme: **{theme}**\n{prompt}",
+        )
         emb.add_field(name="Correct order (host only)", value=" ".join(chr(65+i) for i in correct), inline=False)
         emb.add_field(name="Slot holder", value=f"<@{slot_user_id}>", inline=False)
 
@@ -1533,7 +1674,10 @@ async def q_order(interaction: discord.Interaction):
             msg = await pix.channel.send(
                 embed=discord.Embed(
                     title=f"Box {box_id} — Arrange Question",
-                    description=f"{prompt}\n\nOnly the slot holder may answer using the **Answer** button."
+                    description=(
+                        f"Theme: **{theme}**\n{prompt}\n\n"
+                        "Only the slot holder may answer using the **Answer** button."
+                    )
                 ),
                 view=OrderAnswerView(pix.guild_id, pix.channel_id, box_id),
             )
@@ -1604,6 +1748,49 @@ async def order(interaction: discord.Interaction, a: str, b: str, c: str, d: str
                 embed=discord.Embed(title=f"Box {box_id} — Card Selection", description="Slot holder: pick a card to reveal."),
                 view=CardPickView(interaction.guild_id, interaction.channel_id, box_id),
             )
+        else:
+            con2 = db()
+            try:
+                players = con2.execute(
+                    """SELECT user_id, display_name
+                       FROM participants
+                       WHERE guild_id=? AND channel_id=? AND eliminated=0 AND user_id<>?
+                       ORDER BY display_name COLLATE NOCASE ASC""",
+                    (interaction.guild_id, interaction.channel_id, interaction.user.id),
+                ).fetchall()
+
+                if players:
+                    con2.execute(
+                        "UPDATE slot_state SET pending_action='PASS' WHERE guild_id=? AND channel_id=? AND box_id=?",
+                        (interaction.guild_id, interaction.channel_id, box_id),
+                    )
+                    con2.commit()
+
+                    await channel.send(
+                        embed=discord.Embed(
+                            title="Forced PASS",
+                            description=(
+                                f"{interaction.user.mention} has no turns remaining.\n"
+                                "Choose who receives the slot.\n\n"
+                                "Host: return to **/wib_q** after PASS."
+                            )
+                        ),
+                        view=PassButtonsView(players, interaction.user.id, interaction.guild_id, interaction.channel_id, box_id),
+                    )
+                else:
+                    con2.execute(
+                        "UPDATE slot_state SET pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
+                        (interaction.guild_id, interaction.channel_id, box_id),
+                    )
+                    con2.commit()
+                    await channel.send(
+                        embed=discord.Embed(
+                            title="No Turns Remaining",
+                            description="No eligible players to PASS to.\n\nHost: return to **/wib_q**."
+                        )
+                    )
+            finally:
+                con2.close()            
             await channel.send(
                 embed=discord.Embed(title=f"Box {box_id} — Puzzle Submission", description="Slot holder: submit when ready (host will check)."),
                 view=SubmitPuzzleView(interaction.guild_id, interaction.channel_id, box_id),
@@ -2007,6 +2194,11 @@ async def open_box(interaction: discord.Interaction):
             (interaction.guild_id, interaction.channel_id, box_id),
         ).fetchone()
         solver_id = int(solver["user_id"]) if solver else interaction.user.id
+        slot = con.execute(
+            "SELECT slot_user_id FROM slot_state WHERE guild_id=? AND channel_id=? AND box_id=?",
+            (interaction.guild_id, interaction.channel_id, box_id),
+        ).fetchone()
+        slot_user_id = int(slot["slot_user_id"]) if slot and slot["slot_user_id"] is not None else solver_id
 
         prize = con.execute(
             "SELECT title, description FROM prizes WHERE guild_id=? AND channel_id=? AND box_id=?",
@@ -2025,22 +2217,31 @@ async def open_box(interaction: discord.Interaction):
         )
 
         opened_boxes_count = int(sess["opened_boxes_count"]) + 1
-        next_box = min(6, box_id + 1)
         eliminations_unlocked = 1 if opened_boxes_count >= 3 else int(sess["eliminations_unlocked"])
 
         con.execute(
-            "UPDATE sessions SET opened_boxes_count=?, eliminations_unlocked=?, current_box=? WHERE guild_id=? AND channel_id=?",
-            (opened_boxes_count, eliminations_unlocked, next_box, interaction.guild_id, interaction.channel_id),
+            "UPDATE sessions SET opened_boxes_count=?, eliminations_unlocked=? WHERE guild_id=? AND channel_id=?",
+            (opened_boxes_count, eliminations_unlocked, interaction.guild_id, interaction.channel_id),
         )
+        if box_id < 6:
+            con.execute(
+                "UPDATE slot_state SET pending_action='CHOOSE_BOX' WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (interaction.guild_id, interaction.channel_id, box_id),
+            )
         con.commit()
     finally:
         con.close()
 
     channel = interaction.channel
     if isinstance(channel, discord.TextChannel):
+        theme = get_box_theme(int(sess["session_seed"]), box_id)
         emb = discord.Embed(
             title=f"Box {box_id} Opened",
-            description=f"Opened by Mike.\nOwner: <@{solver_id}>\n\n**{prize['title']}**\n{(prize['description'] or '').strip()}"
+            description=(
+                f"Theme: **{theme}**\n"
+                f"Opened by Mike.\nOwner: <@{solver_id}>\n\n"
+                f"**{prize['title']}**\n{(prize['description'] or '').strip()}"
+            )
         )
         await interaction.response.send_message(embed=emb)
         await post_boxes_leaderboard(channel, interaction.guild_id, interaction.channel_id)
@@ -2048,11 +2249,33 @@ async def open_box(interaction: discord.Interaction):
         if box_id < 6:
             con2 = db()
             try:
-                sess2 = con2.execute("SELECT session_seed FROM sessions WHERE guild_id=? AND channel_id=?",
-                                     (interaction.guild_id, interaction.channel_id)).fetchone()
-                ensure_box_secret(con2, interaction.guild_id, interaction.channel_id, int(sess2["session_seed"]), box_id + 1)
+                opened_rows = con2.execute(
+                    "SELECT box_id FROM box_ownership WHERE guild_id=? AND channel_id=?",
+                    (interaction.guild_id, interaction.channel_id),
+                ).fetchall()
+                opened = {int(r["box_id"]) for r in opened_rows}
+                remaining = [b for b in range(1, 7) if b not in opened]
+                session_seed = int(sess["session_seed"])
             finally:
                 con2.close()
+            if remaining:
+                options = [
+                    discord.SelectOption(
+                        label=f"Box {b} — {get_box_theme(session_seed, b)}",
+                        value=str(b),
+                    )
+                    for b in remaining
+                ]
+                await channel.send(
+                    embed=discord.Embed(
+                        title="Choose the Next Box",
+                        description=(
+                            f"Only <@{slot_user_id}> may select.\n\n"
+                            "Host: wait for the selection before running **/wib_q**."
+                        ),
+                    ),
+                    view=NextBoxView(options, slot_user_id, interaction.guild_id, interaction.channel_id, box_id, session_seed),
+                )
         else:
             await channel.send(embed=discord.Embed(title="Session Complete", description="Mega Box opened. Session complete."))
 
@@ -2112,10 +2335,15 @@ async def status(interaction: discord.Interaction):
         slot_user_id = int(slot["slot_user_id"]) if slot and slot["slot_user_id"] is not None else None
         turns = int(slot["turns_left"]) if slot else 0
         pending = slot["pending_action"] if slot else None
+        theme = get_box_theme(int(sess["session_seed"]), box_id)
 
         emb = discord.Embed(title="Session Status")
         emb.add_field(name="Entries locked", value=str(bool(sess["is_locked"])), inline=True)
-        emb.add_field(name="Current box", value=f"Box {box_id}" + (" (MEGA)" if box_id == 6 else ""), inline=True)
+        box_label = f"Box {box_id}" + (" (MEGA)" if box_id == 6 else "")
+        if pending == "CHOOSE_BOX":
+            box_label = f"{box_label} (awaiting next box choice)"
+        emb.add_field(name="Current box", value=box_label, inline=True)
+        emb.add_field(name="Box theme", value=theme, inline=True)
         emb.add_field(name="Opened boxes", value=str(int(sess["opened_boxes_count"])), inline=True)
         emb.add_field(name="Registered (active)", value=str(int(pcount)), inline=True)
         emb.add_field(name="Slot holder", value=(f"<@{slot_user_id}>" if slot_user_id else "None"), inline=True)
