@@ -284,36 +284,36 @@ def _parse_openai_question(payload: dict) -> Tuple[str, int]:
         raise ValueError("OpenAI response missing numeric question/answer.")
     return question, answer
 
-def _fetch_openai_numeric_question(seed: int) -> Tuple[str, int]:
+def _fetch_openai_numeric_question(seed: int, avoid_questions: Optional[List[str]] = None) -> Tuple[str, int]:
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY in environment.")
 
-    # Nonce helps prevent the model repeating the same “default” trivia
-    nonce = now_ms()
+    avoid_questions = avoid_questions or []
+    avoid_block = ""
+    if avoid_questions:
+        # Keep it short; OpenAI doesn't need a huge list
+        recent = avoid_questions[-15:]
+        avoid_block = "Do NOT repeat any of these exact questions:\n- " + "\n- ".join(recent) + "\n"
 
-    banned = [
-        "spider", "legs", "days in a week", "planets", "hours in a day", "months",
-        "continents", "alphabet", "rainbow", "wheels", "fingers", "seasons"
-    ]
-
+    # Retry to avoid repeats
     last_err = None
-    for _ in range(4):
+    for _ in range(6):
+        nonce = random.randint(100000, 999999)
+
         prompt = (
             "Return JSON only: {\"question\":\"...\",\"answer\":number}.\n"
-            "Make ONE short, kid-friendly trivia question whose answer is a whole number.\n"
-            "Rules:\n"
-            "- Avoid overused trivia (NO: spider legs, days in a week, planets, hours in a day, months, continents, alphabet, rainbow).\n"
-            "- Prefer varied topics: animals (not legs), food, sports, music, films, objects, simple geography (not capitals).\n"
-            "- Keep the question under 120 characters.\n"
-            "- Answer MUST be an integer between 0 and 100.\n"
-            f"Uniqueness nonce: {nonce}\n"
+            "Create a simple, kid-friendly trivia question whose answer is a whole number.\n"
+            "Keep it short. Avoid maths riddles. Avoid the usual overused ones (spider legs, crayons in a box, etc.).\n"
+            "The question must be general knowledge (not opinion), and the answer must be an integer.\n"
+            f"{avoid_block}"
             f"Seed: {seed}\n"
+            f"Nonce: {nonce}\n"
         )
 
         body = json.dumps({
             "model": "gpt-4o-mini",
             "input": prompt,
-            "temperature": 0.9,  # more variety than 0.4 to reduce repeats
+            "temperature": 0.7,          # raise a bit to reduce repeats
             "max_output_tokens": 120,
         }).encode("utf-8")
 
@@ -333,22 +333,20 @@ def _fetch_openai_numeric_question(seed: int) -> Tuple[str, int]:
 
             q, ans = _parse_openai_question(payload)
 
-            q_l = (q or "").lower()
-            if any(b in q_l for b in banned):
-                last_err = ValueError("Overused/banned question generated.")
-                continue
+            # Normalise for duplicate detection
+            q_norm = " ".join(q.strip().split()).lower()
+            avoid_norm = {(" ".join(x.strip().split()).lower()) for x in avoid_questions}
 
-            if not isinstance(ans, int) or ans < 0 or ans > 100:
-                last_err = ValueError("Answer out of range or not int.")
-                continue
+            if q_norm in avoid_norm:
+                continue  # try again
 
             return q, int(ans)
 
-        except Exception as exc:
-            last_err = exc
+        except Exception as e:
+            last_err = e
             continue
 
-    raise ValueError(f"OpenAI failed to return a valid non-repeating numeric question: {last_err}")
+    raise RuntimeError(f"OpenAI failed to produce a non-repeating numeric question. Last error: {last_err}")
 
 
 def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
@@ -636,7 +634,7 @@ class PreviewPublishView(discord.ui.View):
 # ---- NEW: Numeric Answer button -> modal ----
 
 class NumericAnswerModal(discord.ui.Modal, title="Submit Answer"):
-    answer = discord.ui.TextInput(label="Your number", placeholder="Enter a whole number", max_length=12)
+    answer = discord.ui.TextInput(label="Your answer", placeholder="Enter a whole number", max_length=12)
 
     def __init__(self, guild_id: int, channel_id: int, box_id: int):
         super().__init__()
@@ -707,7 +705,7 @@ class NumericAnswerView(discord.ui.View):
 class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
     order = discord.ui.TextInput(
         label="Order",
-        placeholder="Example: A B C D E (or ABCDE)",
+        placeholder="Example: B D E A C (or BDEAC)",
         max_length=32
     )
 
@@ -718,17 +716,15 @@ class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
         self.box_id = box_id
 
     async def on_submit(self, interaction: discord.Interaction):
-        letters = [
-            self.a.value or "",
-            self.b.value or "",
-            self.c.value or "",
-            self.d.value or "",
-            self.e.value or "",
-        ]
+        raw = (self.order.value or "").strip().upper()
+
+        # Accept "B D E A C" or "BDEAC" or "B, D, E, A, C"
+        raw = re.sub(r"[^A-E]", "", raw)  # keep only A-E letters
         letters = list(raw)
-        if sorted(letters) != ["A", "B", "C", "D", "E"]:
+
+        if len(letters) != 5 or sorted(letters) != ["A", "B", "C", "D", "E"]:
             return await interaction.response.send_message(
-                "Invalid order. Use each of A B C D E exactly once.",
+                "Invalid order. Use each of A B C D E exactly once (e.g. **BDEAC**).",
                 ephemeral=True
             )
 
@@ -749,18 +745,26 @@ class OrderAnswerModal(discord.ui.Modal, title="Submit Order"):
 
         box_id, turns = result
         channel = interaction.channel
+
         if isinstance(channel, discord.TextChannel):
             await channel.send(embed=discord.Embed(
                 title=f"Box {box_id} — Turns Awarded",
                 description=f"{interaction.user.mention} earned **{turns}** turn(s).\n\nUse your turns to reveal cards."
             ))
+
             if turns > 0:
                 await channel.send(
-                    embed=discord.Embed(title=f"Box {box_id} — Card Selection", description="Slot holder: pick a card to reveal."),
+                    embed=discord.Embed(
+                        title=f"Box {box_id} — Card Selection",
+                        description="Slot holder: pick a card to reveal."
+                    ),
                     view=CardPickView(interaction.guild_id, interaction.channel_id, box_id),
                 )
                 await channel.send(
-                    embed=discord.Embed(title=f"Box {box_id} — Puzzle Submission", description="Slot holder: submit when ready (host will check)."),
+                    embed=discord.Embed(
+                        title=f"Box {box_id} — Puzzle Submission",
+                        description="Slot holder: submit when ready (host will check)."
+                    ),
                     view=SubmitPuzzleView(interaction.guild_id, interaction.channel_id, box_id),
                 )
 
