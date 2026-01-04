@@ -2236,6 +2236,104 @@ class PrizeModal(discord.ui.Modal, title="Fill Prize"):
         finally:
             con.close()
         await interaction.response.send_message("Prize saved.", ephemeral=True)
+class BulkPrizeModal(discord.ui.Modal, title="Set Prizes (All Boxes)"):
+    data = discord.ui.TextInput(
+        label="Prizes (one per line)",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=4000,
+        placeholder=(
+            "Format (one line each):\n"
+            "1 | Prize Title | optional description\n"
+            "2 | Prize Title | optional description\n"
+            "...\n"
+            "6 | Mega Prize Title | optional description\n\n"
+            "Example:\n"
+            "1 | 5k Credits | Winner gets 5,000 credits\n"
+            "6 | MEGA BOX | All donated prizes + 20k credits"
+        ),
+    )
+
+    def __init__(self, guild_id: int, channel_id: int):
+        super().__init__()
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_owner(interaction.user):
+            return await interaction.response.send_message("Owner permission required.", ephemeral=True)
+
+        raw = (self.data.value or "").strip()
+        if not raw:
+            return await interaction.response.send_message("Nothing provided.", ephemeral=True)
+
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        parsed: Dict[int, Tuple[str, str]] = {}
+
+        for ln in lines:
+            # allow "1 | title | desc" or "1|title|desc"
+            parts = [p.strip() for p in ln.split("|")]
+            if len(parts) < 2:
+                return await interaction.response.send_message(
+                    f"Invalid line:\n`{ln}`\nUse: `box | title | optional description`",
+                    ephemeral=True,
+                )
+
+            box_s = parts[0]
+            title = parts[1].strip()
+            desc = parts[2].strip() if len(parts) >= 3 else ""
+
+            if not box_s.isdigit():
+                return await interaction.response.send_message(
+                    f"Invalid box number in line:\n`{ln}`",
+                    ephemeral=True,
+                )
+
+            box_id = int(box_s)
+            if box_id < 1 or box_id > 6:
+                return await interaction.response.send_message(
+                    f"Box must be 1–6. Bad line:\n`{ln}`",
+                    ephemeral=True,
+                )
+
+            if not title:
+                return await interaction.response.send_message(
+                    f"Missing title for Box {box_id}. Bad line:\n`{ln}`",
+                    ephemeral=True,
+                )
+
+            parsed[box_id] = (title[:120], desc[:800])
+
+        if not parsed:
+            return await interaction.response.send_message("No valid prize lines found.", ephemeral=True)
+
+        con = db()
+        try:
+            for box_id, (title, desc) in parsed.items():
+                con.execute(
+                    """INSERT INTO prizes (guild_id, channel_id, box_id, title, description, filled_by, filled_at_ms)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(guild_id, channel_id, box_id) DO UPDATE SET
+                         title=excluded.title,
+                         description=excluded.description,
+                         filled_by=excluded.filled_by,
+                         filled_at_ms=excluded.filled_at_ms
+                    """,
+                    (self.guild_id, self.channel_id, box_id, title, desc, interaction.user.id, now_ms()),
+                )
+            con.commit()
+        finally:
+            con.close()
+
+        done = ", ".join(f"Box {b}" for b in sorted(parsed.keys()))
+        await interaction.response.send_message(f"Saved prizes for: {done}", ephemeral=True)
+
+
+@wib.command(name="prize_set_all", description="Mike only: set prizes for multiple boxes in one modal.")
+async def prize_set_all(interaction: discord.Interaction):
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message("Owner permission required.", ephemeral=True)
+    await interaction.response.send_modal(BulkPrizeModal(interaction.guild_id, interaction.channel_id))
 
 @wib.command(name="prize_set", description="Mike only: pre-fill prize for a box (hidden until opened).")
 @app_commands.describe(box_id="Box number (1-6)")
@@ -2435,6 +2533,18 @@ async def status(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=emb, ephemeral=True)
 
+@wib.command(name="sync_guild", description="Mike only: force-sync commands to this server (fixes 'outdated').")
+async def sync_guild(interaction: discord.Interaction):
+    if not is_owner(interaction.user):
+        return await interaction.response.send_message("Owner permission required.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        bot.tree.copy_global_to(guild=interaction.guild)
+        await bot.tree.sync(guild=interaction.guild)
+        await interaction.followup.send("Synced commands to this server.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Sync failed: {e}", ephemeral=True)
 
 @bot.event
 async def on_ready():
