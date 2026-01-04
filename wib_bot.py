@@ -197,10 +197,29 @@ def init_db():
     con = db()
     try:
         con.executescript(SCHEMA)
+
+        # existing
         try:
             con.execute("ALTER TABLE sessions ADD COLUMN lobby_msg_id INTEGER")
         except sqlite3.OperationalError:
             pass
+
+        # NEW: Mega-pot donation flags on box_ownership
+        try:
+            con.execute("ALTER TABLE box_ownership ADD COLUMN donated_to_mega INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            con.execute("ALTER TABLE box_ownership ADD COLUMN donated_by INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            con.execute("ALTER TABLE box_ownership ADD COLUMN donated_at_ms INTEGER")
+        except sqlite3.OperationalError:
+            pass
+
         con.commit()
     finally:
         con.close()
@@ -240,31 +259,68 @@ def _fetch_openai_numeric_question(seed: int) -> Tuple[str, int]:
     if not OPENAI_API_KEY:
         raise RuntimeError("Missing OPENAI_API_KEY in environment.")
 
-    prompt = (
-        "Return JSON only: {\"question\":\"...\",\"answer\":number}.\n"
-        "Make a very simple, kid-friendly trivia question whose answer is a whole number.\n"
-        "Keep it short and avoid math riddles. The answer must be an integer.\n"
-        f"Seed: {seed}"
-    )
-    body = json.dumps({
-        "model": "gpt-4o-mini",
-        "input": prompt,
-        "temperature": 0.4,
-        "max_output_tokens": 120,
-    }).encode("utf-8")
+    # Nonce helps prevent the model repeating the same “default” trivia
+    nonce = now_ms()
 
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=body,
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        payload = json.load(resp)
-    return _parse_openai_question(payload)
+    banned = [
+        "spider", "legs", "days in a week", "planets", "hours in a day", "months",
+        "continents", "alphabet", "rainbow", "wheels", "fingers", "seasons"
+    ]
+
+    last_err = None
+    for _ in range(4):
+        prompt = (
+            "Return JSON only: {\"question\":\"...\",\"answer\":number}.\n"
+            "Make ONE short, kid-friendly trivia question whose answer is a whole number.\n"
+            "Rules:\n"
+            "- Avoid overused trivia (NO: spider legs, days in a week, planets, hours in a day, months, continents, alphabet, rainbow).\n"
+            "- Prefer varied topics: animals (not legs), food, sports, music, films, objects, simple geography (not capitals).\n"
+            "- Keep the question under 120 characters.\n"
+            "- Answer MUST be an integer between 0 and 100.\n"
+            f"Uniqueness nonce: {nonce}\n"
+            f"Seed: {seed}\n"
+        )
+
+        body = json.dumps({
+            "model": "gpt-4o-mini",
+            "input": prompt,
+            "temperature": 0.9,  # more variety than 0.4 to reduce repeats
+            "max_output_tokens": 120,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/responses",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                payload = json.load(resp)
+
+            q, ans = _parse_openai_question(payload)
+
+            q_l = (q or "").lower()
+            if any(b in q_l for b in banned):
+                last_err = ValueError("Overused/banned question generated.")
+                continue
+
+            if not isinstance(ans, int) or ans < 0 or ans > 100:
+                last_err = ValueError("Answer out of range or not int.")
+                continue
+
+            return q, int(ans)
+
+        except Exception as exc:
+            last_err = exc
+            continue
+
+    raise ValueError(f"OpenAI failed to return a valid non-repeating numeric question: {last_err}")
+
 
 def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
     q, ans = _fetch_openai_numeric_question(seed + box_id * 7 + player_count)
@@ -335,6 +391,78 @@ def gen_phrase_and_deck(seed: int, box_id: int) -> Tuple[Tuple[str, str, str], L
 # -----------------------------
 # Discord UI Components
 # -----------------------------
+class PassButton(discord.ui.Button):
+    def __init__(self, target_id: int, label: str, slot_user_id: int, guild_id: int, channel_id: int, box_id: int):
+        super().__init__(label=label[:80], style=discord.ButtonStyle.primary, custom_id=f"wib:pass_to:{target_id}")
+        self.target_id = target_id
+        self.slot_user_id = slot_user_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.box_id = box_id
+
+    async def callback(self, ix: discord.Interaction):
+        await ix.response.defer(ephemeral=True)
+
+        # Only the slot holder may choose
+        if ix.user.id != self.slot_user_id:
+            return await ix.followup.send("Only the current slot holder can choose who to PASS to.", ephemeral=True)
+
+        con2 = db()
+        try:
+            # Safety: ensure PASS still pending and slot holder still valid
+            slot = con2.execute(
+                "SELECT slot_user_id, pending_action FROM slot_state WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (self.guild_id, self.channel_id, self.box_id),
+            ).fetchone()
+
+            if not slot or slot["slot_user_id"] is None or int(slot["slot_user_id"]) != self.slot_user_id:
+                return await ix.followup.send("PASS is no longer active.", ephemeral=True)
+
+            if slot["pending_action"] != "PASS":
+                return await ix.followup.send("PASS is no longer pending.", ephemeral=True)
+
+            # Transfer the slot and clear pending action
+            con2.execute(
+                "UPDATE slot_state SET slot_user_id=?, turns_left=0, pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (self.target_id, self.guild_id, self.channel_id, self.box_id),
+            )
+            con2.commit()
+        finally:
+            con2.close()
+
+        # Disable all buttons after selection
+        for child in self.view.children:
+            child.disabled = True
+        try:
+            await ix.message.edit(view=self.view)
+        except Exception:
+            pass
+
+        # Public announce
+        if isinstance(ix.channel, discord.TextChannel):
+            await ix.channel.send(embed=discord.Embed(
+                title="PASS Completed",
+                description=f"Slot moved to <@{self.target_id}>."
+            ))
+
+        await ix.followup.send("Done.", ephemeral=True)
+
+
+class PassButtonsView(discord.ui.View):
+    def __init__(self, players: List[sqlite3.Row], slot_user_id: int, guild_id: int, channel_id: int, box_id: int):
+        super().__init__(timeout=300)
+        self.slot_user_id = slot_user_id
+
+        # Discord allows max 25 components total
+        for p in players[:25]:
+            uid = int(p["user_id"])
+            label = p["display_name"] or str(uid)
+            self.add_item(PassButton(uid, label, slot_user_id, guild_id, channel_id, box_id))
+
+    async def on_timeout(self):
+        # Disable after timeout to prevent stale clicks
+        for child in self.children:
+            child.disabled = True
 
 class JoinView(discord.ui.View):
     def __init__(self, bot: commands.Bot, guild_id: int, channel_id: int, locked: bool = False):
@@ -696,13 +824,58 @@ class CardButton(discord.ui.Button):
                         title=f"Box {box_id} — Puzzle Piece Revealed",
                         description=f"Revealed word: **{word}**\nTurns left: **{turns_left}**"
                     ))
+          
             elif card["type"] in ("PASS", "STEAL", "DONATE"):
                 pending_action = card["type"]
-                if isinstance(channel, discord.TextChannel):
-                    await channel.send(embed=discord.Embed(
-                        title=f"Special Card Revealed: {pending_action}",
-                        description="Host must trigger the selection UI."
-                    ))
+            
+                if pending_action == "PASS":
+                    # Build eligible list immediately and post buttons
+                    con2 = db()
+                    try:
+                        slot_user_id = int(slot["slot_user_id"])
+                        players = con2.execute(
+                            """SELECT user_id, display_name
+                               FROM participants
+                               WHERE guild_id=? AND channel_id=? AND eliminated=0 AND user_id<>?
+                               ORDER BY display_name COLLATE NOCASE ASC""",
+                            (guild_id, channel_id, slot_user_id),
+                        ).fetchall()
+            
+                        if not players:
+                            # Auto-resolve PASS if no eligible players
+                            pending_action = None
+                            con2.execute(
+                                "UPDATE slot_state SET pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
+                                (guild_id, channel_id, box_id),
+                            )
+                            con2.commit()
+            
+                            if isinstance(channel, discord.TextChannel):
+                                await channel.send(embed=discord.Embed(
+                                    title="PASS Resolved Automatically",
+                                    description="No eligible players available. Slot remains with the current holder."
+                                ))
+                        else:
+                            # Keep PASS pending until selection
+                            if isinstance(channel, discord.TextChannel):
+                                await channel.send(
+                                    embed=discord.Embed(
+                                        title="Special Card Revealed: PASS",
+                                        description=f"Only <@{slot_user_id}> may choose who receives the slot."
+                                    ),
+                                    view=PassButtonsView(players, slot_user_id, guild_id, channel_id, box_id)
+                                )
+                    finally:
+                        con2.close()
+            
+                else:
+                    # Keep your existing host-driven flow for STEAL/DONATE
+                    if isinstance(channel, discord.TextChannel):
+                        await channel.send(embed=discord.Embed(
+                            title=f"Special Card Revealed: {pending_action}",
+                            description="Host must trigger the selection UI."
+                        ))
+
             elif card["type"] == "WILDCARD":
                 effects = ["PASS", "STEAL", "BONUS_TURN"]
                 if box_id == 6:
