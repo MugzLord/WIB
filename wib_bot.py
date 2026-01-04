@@ -1018,6 +1018,14 @@ async def lock(interaction: discord.Interaction):
         con.commit()
         seed = int(sess["session_seed"])
         pcount = get_participant_count(con, interaction.guild_id, interaction.channel_id)
+        players = con.execute(
+            """SELECT user_id, display_name
+               FROM participants
+               WHERE guild_id=? AND channel_id=? AND eliminated=0
+               ORDER BY joined_at_ms ASC""",
+            (interaction.guild_id, interaction.channel_id),
+        ).fetchall()
+
         lobby_msg_id = sess["lobby_msg_id"]
         ensure_box_secret(con, interaction.guild_id, interaction.channel_id, seed, 1)
     finally:
@@ -1032,7 +1040,28 @@ async def lock(interaction: discord.Interaction):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
-    await interaction.response.send_message(f"Entries locked. Registered players: **{pcount}**.\nSession seed locked.")
+    if players:
+        lines = []
+        for p in players:
+            member = interaction.guild.get_member(int(p["user_id"]))
+            name = member.mention if member else p["display_name"]
+            lines.append(f"• {name}")
+    
+        player_list = "\n".join(lines)
+        desc = (
+            f"Entries locked. Registered players (**{len(players)}**):\n"
+            f"{player_list}\n\n"
+            "Session seed locked."
+        )
+    else:
+        desc = "Entries locked. No registered players found.\nSession seed locked."
+    
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="Session Locked",
+            description=desc
+        )
+    )
 
 
 @bot.tree.command(name="wib_q", description="Preview a question for the current box.")
