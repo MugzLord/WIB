@@ -605,6 +605,42 @@ class JoinView(discord.ui.View):
 
         await interaction.followup.send("You are registered for this session.", ephemeral=True)
 
+        # --- Update lobby counter on the same message ---
+        try:
+            con2 = db()
+            try:
+                count = con2.execute(
+                    "SELECT COUNT(*) FROM participants WHERE guild_id=? AND channel_id=? AND eliminated=0",
+                    (self.guild_id, self.channel_id),
+                ).fetchone()[0]
+
+                locked_row = con2.execute(
+                    "SELECT is_locked FROM sessions WHERE guild_id=? AND channel_id=?",
+                    (self.guild_id, self.channel_id),
+                ).fetchone()
+                locked = bool(locked_row and int(locked_row["is_locked"]) == 1)
+            finally:
+                con2.close()
+
+            emb = discord.Embed(
+                title="Session Registration",
+                description=(
+                    "Click **Join** to register for this session.\n"
+                    "Host will lock entries when ready.\n\n"
+                    f"**Registered players:** {count}"
+                ),
+            )
+
+            # Disable Join button if locked
+            self.join_button.disabled = locked
+
+            if interaction.message:
+                await interaction.message.edit(embed=emb, view=self)
+
+        except Exception:
+            pass
+
+
 
 class PreviewPublishView(discord.ui.View):
     def __init__(self, on_publish, on_regen, on_cancel):
