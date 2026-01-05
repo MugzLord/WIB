@@ -1348,11 +1348,24 @@ async def lobby(interaction: discord.Interaction):
         sess = ensure_session(con, interaction.guild_id, interaction.channel_id)
         if int(sess["is_locked"]) == 1:
             return await interaction.response.send_message("Session is already locked.", ephemeral=True)
+
+        count = con.execute(
+            "SELECT COUNT(*) FROM participants WHERE guild_id=? AND channel_id=? AND eliminated=0",
+            (interaction.guild_id, interaction.channel_id),
+        ).fetchone()[0]
     finally:
         con.close()
 
     view = JoinView(bot, interaction.guild_id, interaction.channel_id)
-    emb = discord.Embed(title="Session Registration", description="Click **Join** to register for this session.\nHost will lock entries when ready.")
+    emb = discord.Embed(
+        title="Session Registration",
+        description=(
+            "Click **Join** to register for this session.\n"
+            "Host will lock entries when ready.\n\n"
+            f"**Registered players:** {count}"
+        )
+    )
+
     await interaction.response.send_message(embed=emb, view=view)
     msg = await interaction.original_response()
 
@@ -1365,6 +1378,7 @@ async def lobby(interaction: discord.Interaction):
         con.commit()
     finally:
         con.close()
+
 
 @wib.command(name="lock", description="Lock session entries (one-time).")
 async def lock(interaction: discord.Interaction):
@@ -1417,10 +1431,10 @@ async def lock(interaction: discord.Interaction):
         desc = (
             f"Entries locked. Registered players (**{len(players)}**):\n"
             f"{player_list}\n\n"
-            "Session seed locked."
+            "Session locked."
         )
     else:
-        desc = "Entries locked. No registered players found.\nSession seed locked."
+        desc = "Entries locked. No registered players found.\nSession locked."
     
     await interaction.response.send_message(
         embed=discord.Embed(
