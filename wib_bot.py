@@ -677,7 +677,7 @@ class JoinView(discord.ui.View):
 
         await interaction.followup.send("You are registered for this session.", ephemeral=True)
 
-        # --- Update lobby counter on the same message ---
+        # --- Update lobby embed count on the message that was clicked (most reliable) ---
         try:
             con2 = db()
             try:
@@ -691,6 +691,14 @@ class JoinView(discord.ui.View):
                     (self.guild_id, self.channel_id),
                 ).fetchone()
                 locked = bool(locked_row and int(locked_row["is_locked"]) == 1)
+
+                # IMPORTANT: keep lobby_msg_id in sync with the message people are clicking
+                if interaction.message:
+                    con2.execute(
+                        "UPDATE sessions SET lobby_msg_id=? WHERE guild_id=? AND channel_id=?",
+                        (int(interaction.message.id), self.guild_id, self.channel_id),
+                    )
+                    con2.commit()
             finally:
                 con2.close()
 
@@ -700,20 +708,18 @@ class JoinView(discord.ui.View):
                     "Click **Join** to register for this session.\n"
                     "Host will lock entries when ready.\n\n"
                     f"**Registered players:** {count}\n"
-                    "Be here when it starts — if you vanish, we'll assume you've been stolen by the box."
-                )
+                    "Be here when it starts — if you vanish, we’ll assume you’ve been stolen by the box."
+                ),
             )
-            
 
-            # Disable Join button if locked
-            self.join_button.disabled = locked
+            # Use the actual Button instance provided by the callback
+            button.disabled = locked
 
             if interaction.message:
-                await maybe_bump_lobby_message(self.bot, self.guild_id, self.channel_id, emb, self)
+                await interaction.message.edit(embed=emb, view=self)
 
-        except Exception:
-            pass
-
+        except Exception as e:
+            print(f"[WIB] lobby counter update failed: {e}")
 
 
 class PreviewPublishView(discord.ui.View):
