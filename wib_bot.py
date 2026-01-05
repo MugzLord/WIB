@@ -22,6 +22,9 @@ HOST_ROLE_NAME = (os.getenv("HOST_ROLE_NAME", "") or "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
 LOBBY_BUMP_AFTER_MESSAGES = 15  # bump when 15+ new messages since the lobby post
+RECENT_Q_BY_CHANNEL: Dict[Tuple[int, int], List[str]] = {}
+RECENT_Q_LIMIT = 25
+
 
 
 if not DISCORD_TOKEN:
@@ -412,9 +415,19 @@ def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str
     q, ans = _fetch_openai_numeric_question(seed + box_id * 7 + player_count)
     return f"Box {box_id}: {q}", int(ans)
 
-async def generate_numeric_question_async(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
-    q, ans = await asyncio.to_thread(_fetch_openai_numeric_question, seed + box_id * 7 + player_count)
+async def generate_numeric_question_async(
+    seed: int,
+    box_id: int,
+    player_count: int,
+    avoid_questions: Optional[List[str]] = None
+) -> Tuple[str, int]:
+    q, ans = await asyncio.to_thread(
+        _fetch_openai_numeric_question,
+        seed + box_id * 7 + player_count,
+        avoid_questions
+    )
     return f"Box {box_id}: {q}", int(ans)
+
 
 def gen_order_question(seed: int, box_id: int) -> Tuple[str, List[str], List[int]]:
     rng = random.Random(seed * 200 + box_id * 19)
@@ -1580,6 +1593,11 @@ async def wib_q(interaction: discord.Interaction):
         last_q_text = (last_q["q_text"] if last_q else "") or ""
         seed = int(sess["session_seed"])
         pcount = get_participant_count(con, interaction.guild_id, interaction.channel_id)
+        key = (interaction.guild_id, interaction.channel_id)
+        recent = RECENT_Q_BY_CHANNEL.get(key, [])
+        avoid_list = [last_q_text] if last_q_text.strip() else []
+        avoid_list.extend(recent)
+
     finally:
         con.close()
 
@@ -1588,7 +1606,7 @@ async def wib_q(interaction: discord.Interaction):
         ans = None
         for attempt in range(3):
             try:
-                q, ans = await generate_numeric_question_async(seed + salt + attempt, box_id, pcount)
+                q, ans = await generate_numeric_question_async(seed + salt + attempt, box_id, pcount, avoid_questions=avoid_list)
             except Exception:
                 q = None
                 continue
@@ -1673,6 +1691,12 @@ async def wib_q(interaction: discord.Interaction):
                 con3.commit()
             finally:
                 con3.close()
+
+            # --- Remember this question to prevent repeats ---
+            key = (pix.guild_id, pix.channel_id)
+            lst = RECENT_Q_BY_CHANNEL.get(key, [])
+            lst.append(q.strip())
+            RECENT_Q_BY_CHANNEL[key] = lst[-RECENT_Q_LIMIT:]
 
             await pix.followup.send("Published.", ephemeral=True)
 
