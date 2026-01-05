@@ -21,6 +21,8 @@ DB_PATH = os.getenv("DB_PATH", "./wib.db")
 HOST_ROLE_NAME = (os.getenv("HOST_ROLE_NAME", "") or "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+LOBBY_BUMP_AFTER_MESSAGES = 15  # bump when 15+ new messages since the lobby post
+
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN in environment.")
@@ -348,6 +350,63 @@ def _fetch_openai_numeric_question(seed: int, avoid_questions: Optional[List[str
 
     raise RuntimeError(f"OpenAI failed to produce a non-repeating numeric question. Last error: {last_err}")
 
+async def maybe_bump_lobby_message(bot: commands.Bot, guild_id: int, channel_id: int, new_embed: discord.Embed, view: discord.ui.View):
+    con = db()
+    try:
+        sess = con.execute(
+            "SELECT lobby_msg_id FROM sessions WHERE guild_id=? AND channel_id=?",
+            (guild_id, channel_id),
+        ).fetchone()
+        if not sess or not sess["lobby_msg_id"]:
+            return
+        lobby_msg_id = int(sess["lobby_msg_id"])
+    finally:
+        con.close()
+
+    channel = bot.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        lobby_msg = await channel.fetch_message(lobby_msg_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+
+    # Count how many messages have happened after the lobby message
+    try:
+        newer = 0
+        async for _ in channel.history(limit=LOBBY_BUMP_AFTER_MESSAGES + 1, after=lobby_msg.created_at):
+            newer += 1
+            if newer >= LOBBY_BUMP_AFTER_MESSAGES:
+                break
+    except Exception:
+        newer = 0
+
+    if newer >= LOBBY_BUMP_AFTER_MESSAGES:
+        # Re-post near the bottom (more visible)
+        new_msg = await channel.send(embed=new_embed, view=view)
+
+        con2 = db()
+        try:
+            con2.execute(
+                "UPDATE sessions SET lobby_msg_id=? WHERE guild_id=? AND channel_id=?",
+                (new_msg.id, guild_id, channel_id),
+            )
+            con2.commit()
+        finally:
+            con2.close()
+
+        # Optional: delete the old one (only if you want to reduce clutter)
+        try:
+            await lobby_msg.delete()
+        except Exception:
+            pass
+    else:
+        # Not buried: just edit in place
+        try:
+            await lobby_msg.edit(embed=new_embed, view=view)
+        except Exception:
+            pass
 
 def gen_numeric_question(seed: int, box_id: int, player_count: int) -> Tuple[str, int]:
     q, ans = _fetch_openai_numeric_question(seed + box_id * 7 + player_count)
@@ -637,7 +696,7 @@ class JoinView(discord.ui.View):
             self.join_button.disabled = locked
 
             if interaction.message:
-                await interaction.message.edit(embed=emb, view=self)
+                await maybe_bump_lobby_message(self.bot, self.guild_id, self.channel_id, emb, self)
 
         except Exception:
             pass
