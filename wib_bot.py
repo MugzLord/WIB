@@ -627,9 +627,11 @@ class JoinView(discord.ui.View):
                 description=(
                     "Click **Join** to register for this session.\n"
                     "Host will lock entries when ready.\n\n"
-                    f"**Registered players:** {count}"
-                ),
+                    f"**Registered players:** {count}\n"
+                    "Be here when it starts — if you vanish, we'll assume you've been stolen by the box."
+                )
             )
+            
 
             # Disable Join button if locked
             self.join_button.disabled = locked
