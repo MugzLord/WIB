@@ -1958,13 +1958,19 @@ async def steal_show(interaction: discord.Interaction):
                            (interaction.guild_id, interaction.channel_id)).fetchone()
         if not sess:
             return await interaction.response.send_message("No session.", ephemeral=True)
+
         box_id = int(sess["current_box"])
-        slot = con.execute("SELECT slot_user_id, pending_action FROM slot_state WHERE guild_id=? AND channel_id=? AND box_id=?",
-                           (interaction.guild_id, interaction.channel_id, box_id)).fetchone()
+        slot = con.execute(
+            "SELECT slot_user_id, pending_action FROM slot_state WHERE guild_id=? AND channel_id=? AND box_id=?",
+            (interaction.guild_id, interaction.channel_id, box_id)
+        ).fetchone()
+
         if not slot or slot["pending_action"] != "STEAL" or slot["slot_user_id"] is None:
             return await interaction.response.send_message("No STEAL pending.", ephemeral=True)
+
         slot_user_id = int(slot["slot_user_id"])
 
+        # Fetch opened boxes (1-5) as before
         rows = con.execute(
             """SELECT o.box_id, o.owner_user_id
                FROM box_ownership o
@@ -1972,12 +1978,35 @@ async def steal_show(interaction: discord.Interaction):
                ORDER BY o.box_id ASC""",
             (interaction.guild_id, interaction.channel_id),
         ).fetchall()
+
+        # NEW: filter out boxes already owned by the slot holder (no "steal your own box")
+        eligible_rows = [r for r in rows if int(r["owner_user_id"]) != slot_user_id]
+
+        # NEW: if nothing eligible, auto-resolve STEAL (do not show UI)
+        if not eligible_rows:
+            con.execute(
+                "UPDATE slot_state SET pending_action=NULL WHERE guild_id=? AND channel_id=? AND box_id=?",
+                (interaction.guild_id, interaction.channel_id, box_id),
+            )
+            con.commit()
+
+            # Tell host (ephemeral) and optionally announce in channel
+            await interaction.response.send_message(
+                "No eligible boxes to steal (slot holder already owns all opened boxes). STEAL auto-resolved.",
+                ephemeral=True
+            )
+
+            if isinstance(interaction.channel, discord.TextChannel):
+                await interaction.channel.send(embed=discord.Embed(
+                    title="STEAL Resolved Automatically",
+                    description=f"<@{slot_user_id}> has no eligible boxes to steal. STEAL skipped."
+                ))
+            return
+
     finally:
         con.close()
 
-    if not rows:
-        return await interaction.response.send_message("No eligible boxes to steal yet.", ephemeral=True)
-
+    # If we got here, we have eligible boxes to steal
     class StealButton(discord.ui.Button):
         def __init__(self, box_to_steal: int, owner_id: int):
             super().__init__(label=f"Steal Box {box_to_steal}", style=discord.ButtonStyle.danger)
@@ -1988,8 +2017,6 @@ async def steal_show(interaction: discord.Interaction):
             await ix.response.defer(ephemeral=True)
             if ix.user.id != slot_user_id:
                 return await ix.followup.send("Only the slot holder can steal.", ephemeral=True)
-            if self.owner_id == slot_user_id:
-                return await ix.followup.send("You already own that box.", ephemeral=True)
 
             con2 = db()
             try:
@@ -2021,12 +2048,16 @@ async def steal_show(interaction: discord.Interaction):
     class StealView(discord.ui.View):
         def __init__(self):
             super().__init__(timeout=300)
-            for r in rows:
+            for r in eligible_rows:
                 self.add_item(StealButton(int(r["box_id"]), int(r["owner_user_id"])))
 
-    lines = [f"Box {int(r['box_id'])} — owner: <@{int(r['owner_user_id'])}>" for r in rows]
-    emb = discord.Embed(title="STEAL Selection", description="\n".join(lines) + f"\n\nOnly <@{slot_user_id}> may select.")
+    lines = [f"Box {int(r['box_id'])} — owner: <@{int(r['owner_user_id'])}>" for r in eligible_rows]
+    emb = discord.Embed(
+        title="STEAL Selection",
+        description="\n".join(lines) + f"\n\nOnly <@{slot_user_id}> may select."
+    )
     await interaction.response.send_message(embed=emb, view=StealView())
+
 
 @wib.command(name="donate_show", description="Host: show DONATE UI (Mega only). Slot holder donates a box they own.")
 async def donate_show(interaction: discord.Interaction):
